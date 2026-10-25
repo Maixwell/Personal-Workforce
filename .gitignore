@@ -22,3 +22,6 @@ venv/
 *.log
 tmp/
 temp/
+
+# Local conversation history (private; do not commit)
+data/current_session.json

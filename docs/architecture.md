@@ -14,7 +14,7 @@ The first technical prototype **exists**. It is still a **deliberately small V1*
 - File-based long-term memory loaded from `docs/memory.md`
 - A simple interactive Terminal conversation
 - Terminal input: normal single-line messages; `/multi` to enter multiline input; `/send` to submit the multiline message as one user message; `/cancel` to discard a multiline draft
-- Multi-turn conversation context during a running session using `previous_response_id`
+- Resumable conversation history saved locally in `data/current_session.json` (see section 9A)
 
 The multiline Terminal input has been successfully tested and confirmed to deliver a large pasted prompt as a single message to Max Smart.
 
@@ -54,7 +54,7 @@ Max Smart response
 Terminal
 ```
 
-Python currently acts as the **communication and basic orchestration/control layer**. It loads files, keeps the session's `previous_response_id`, sends one request per message, and prints text. It does not run tools or take external actions.
+Python currently acts as the **communication and basic orchestration/control layer**. It loads files, keeps a local session of chat messages, sends each request (including that history) to the OpenAI Responses API, and prints text. It does not run tools or take external actions. The conversation is saved on disk, but replies are still produced by the cloud model — not processed entirely on the Mac.
 
 Until tools exist, the loop ends at **text**: briefings, questions, “not this week” lists — the same job described in the blueprint.
 
@@ -224,8 +224,8 @@ V1 currently:
 2. Reads Adam's goals.
 3. Reads Max's file-based long-term memory.
 4. Accepts interactive messages in the Terminal (single-line, plus `/multi` / `/send` / `/cancel` for a pasted block sent as one user message).
-5. Maintains multi-turn conversation context during the current run.
-6. Sends the relevant context and message to GPT-5.6 Sol through the OpenAI Responses API.
+5. Saves and resumes conversation history locally (details in section 9A).
+6. Sends standing instructions, the full saved message history, and the new user message to GPT-5.6 Sol through the OpenAI Responses API (`store=False`).
 7. Prints Max Smart's response.
 8. Takes no consequential external actions.
 9. Has no tools, external integrations, autonomous execution, databases, or multi-agent orchestration.
@@ -236,10 +236,11 @@ V1 exists primarily to **prove the conversational core** and **teach the archite
 
 ## 9A. Current V1 implementation status
 
-- Working
+- Working (V1.1)
 - Single-model
 - Conversation-first
 - File-based memory
+- Locally saved, resumable conversation history
 - Human-controlled
 - No external actions
 - Terminal interface
@@ -255,11 +256,33 @@ The Terminal interface now supports:
 
 The multiline Terminal input has been successfully tested and confirmed to deliver a large pasted prompt as a single message to Max Smart.
 
-This remains conversational advice in the Terminal. V1 still does not take external actions, use tools, access email/calendar, browse the web, use messaging platforms, run multiple agents, autonomously modify memory, or operate continuously in the background.
+**Conversation history (V1.1)**
 
-**Current conversation context is temporary; file-based memory is persistent.**
+History is saved locally in `data/current_session.json` as a JSON object with a `messages` list. Each message has a `role` (`user` or `assistant`) and text `content`. The `data` directory is created when needed. `.gitignore` excludes `data/current_session.json` from Git.
 
-Closing the program removes the in-memory conversation chain (`previous_response_id`). `docs/memory.md` remains on disk and is loaded again when Max starts.
+The app no longer relies on `previous_response_id`. Each request sends the existing standing instructions (`instructions`) and the full saved message history plus the new user message (`input`) to the OpenAI Responses API, with `store=False`. After a successful API response, the user message and Max's text reply are appended to the local session file.
+
+The history file lives on Adam's machine, but each turn is still sent to OpenAI for model processing. This is not a local-only model.
+
+`docs/memory.md` remains separate: curated long-term memory, manually controlled by Adam, and read-only to Max. Conversation history is not that memory file.
+
+**Startup**
+
+- If no saved session exists, Max starts a new conversation.
+- If a valid session exists, the user chooses Resume (`R`), New (`N`), or Quit (`Q`).
+- Resume restores the conversation history.
+- New begins with empty history and replaces the single saved session.
+- Quit exits without starting a conversation.
+- Invalid menu input prompts the user again.
+- A malformed or unreadable session file produces an error and exits without silently deleting or overwriting the file.
+
+**Limitations (this change)**
+
+- Only one saved conversation is supported at present.
+- Starting a new conversation replaces the saved session.
+- Conversation history is separate from curated long-term memory.
+- Max cannot modify `docs/memory.md`.
+- No tools, external actions, integrations, additional agents, or background operation have been added by this change.
 
 ---
 
@@ -757,3 +780,17 @@ The sophisticated test confirmed Max can:
 - preserve user control over the final decision
 
 The multiline Terminal input has been successfully tested and confirmed to deliver a large pasted prompt as a single message to Max Smart.
+
+### Current milestone — 2026-10-25
+
+Max Smart V1.1 resumable conversation has been verified:
+
+- Session saved with a user message and assistant response.
+- Session file contained the expected two messages.
+- Conversation resumed after restarting Max.
+- Max correctly recovered the test details `amber kite` and `Thursday`.
+- Quit from the startup menu exited without starting a conversation.
+- Starting a new conversation did not carry forward the prior conversation's context.
+- A malformed JSON session file was detected; Max reported that the file had not been changed and exited.
+- A session file containing invalid UTF-8 was detected; a clear error was displayed and the file was left unchanged.
+- The saved session backup was restored and validated as JSON.
