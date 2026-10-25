@@ -26,3 +26,7 @@ temp/
 # Local conversation history (private; do not commit)
 data/current_session.json
 data/.current_session.json.*.tmp
+
+# Personal context (local-only; do not commit)
+/docs/goals.md
+/docs/memory.md

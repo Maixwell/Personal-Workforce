@@ -13,8 +13,8 @@ The first technical prototype **exists**. It is still a **deliberately small V1*
 - OpenAI GPT-5.6 Sol via the Responses API
 - Secure API-key loading from `.env`
 - Max Smart's standing instructions loaded from `docs/max-smart-instructions.md`
-- Adam's goals loaded from `docs/goals.md`
-- File-based long-term memory loaded from `docs/memory.md`
+- Adam's goals loaded from the local-only file `docs/goals.md`
+- File-based long-term memory loaded from the local-only file `docs/memory.md`
 - A simple interactive Terminal conversation
 - Terminal input: normal single-line messages; `/multi` to enter multiline input; `/send` to submit the multiline message as one user message; `/cancel` to discard a multiline draft
 - Resumable conversation history saved locally in `data/current_session.json` (see section 9A)
@@ -126,6 +126,8 @@ Adam can change behaviour by **editing the files**, not by hoping the model “r
 **What context is not:** automatically reading all of Adam's email, disk, or phone. That would be a tool + a permission, and we are not connecting those.
 
 **Practical habit:** keep source-of-truth notes **short and current**. A 3-page goals file beats a 300-page dump the model skims badly.
+
+`docs/goals.md` and `docs/memory.md` are local-only. `.gitignore` ignores those exact paths, while the generic templates `docs/goals.example.md` and `docs/memory.example.md` remain version-controlled. `src/context.py` still reads the two local files from those exact paths. A fresh checkout does not contain them: copy each example to its required filename before running Max, and do not overwrite an existing personal copy.
 
 Later we can get smarter about *which* files to include (only this week's notes). That is still “context,” not magic memory.
 
@@ -274,7 +276,7 @@ The history file lives on Adam's machine, but each turn is still sent to OpenAI 
 
 `src/session.py` owns loading and saving `data/current_session.json`: JSON structure `{"messages": [...]}`, validation of the top-level object, messages list, roles, and text content, and reporting invalid JSON or invalid UTF-8 via `SessionLoadError`. A failed load never deletes, resets, or overwrites the file. On POSIX, saving restricts the session directory to mode 700 and the session file to mode 600. It writes a temporary file in that directory, flushes and `fsync`s it, then replaces the session with `os.replace`. A failed save removes its temporary file and leaves an existing session unchanged. Symbolic links at either the session file or the `data` directory are rejected.
 
-`src/context.py` provides `build_standing_context(project_root)`. It reads `docs/max-smart-instructions.md`, `docs/goals.md`, and `docs/memory.md` in the original order and assembles them with the original labels and separators. It does not write to `docs/memory.md`.
+`src/context.py` provides `build_standing_context(project_root)`. It reads `docs/max-smart-instructions.md`, `docs/goals.md`, and `docs/memory.md` in the original order and assembles them with the original labels and separators. It does not write to `docs/memory.md`. The goals and memory paths are unchanged, but both files are now local-only and ignored by Git. A fresh checkout must create them from `docs/goals.example.md` and `docs/memory.example.md` before Max can start.
 
 `src/model_client.py` provides `get_model_response(client, standing_context, api_input)`. It calls the OpenAI Responses API with `model="gpt-5.6-sol"`, `instructions=standing_context`, `input=api_input`, and `store=False`, then returns `response.output_text` directly. API exceptions propagate as before; this module adds no retries or new exception handling.
 
