@@ -12,6 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from context import build_standing_context
 from session import SessionLoadError, load_session_messages, save_session_messages
 
 # --- 1. Load the secret API key from the project .env file ---
@@ -29,39 +30,8 @@ if not api_key:
 # --- 2. Create an OpenAI client that will talk to the API ---
 client = OpenAI(api_key=api_key)
 
-# --- 3. Load Max's standing instructions ---
-# These come from docs/max-smart-instructions.md (role, challenge, V1 limits).
-instructions_path = project_root / "docs" / "max-smart-instructions.md"
-max_instructions = instructions_path.read_text(encoding="utf-8")
-
-# --- 4. Load Adam's goals ---
-# These come from docs/goals.md (priorities, preferences, boundaries).
-goals_path = project_root / "docs" / "goals.md"
-adam_goals = goals_path.read_text(encoding="utf-8")
-
-# --- 5. Load Max's long-term memory ---
-# Memory is currently:
-# - file-based (docs/memory.md, ordinary markdown Adam can open)
-# - transparent (nothing hidden in a database)
-# - manually controlled by Adam (this program never writes it)
-# - read-only from Max's perspective
-memory_path = project_root / "docs" / "memory.md"
-long_term_memory = memory_path.read_text(encoding="utf-8")
-
-# Combine the three sources into the Responses API "instructions" field.
-standing_context = (
-    "=== Max Smart's standing instructions ===\n\n"
-    + max_instructions
-    + "\n\n---\n\n"
-    + "=== Adam's goals ===\n\n"
-    + adam_goals
-    + "\n\n---\n\n"
-    + "=== Max Smart's long-term memory ===\n\n"
-    + "This memory is file-based, transparent, and edited only by Adam. "
-    + "You may use it as context. You must not modify docs/memory.md "
-    + "or treat yourself as able to write memory.\n\n"
-    + long_term_memory
-)
+# --- 3–5. Standing context (instructions, goals, read-only memory) ---
+standing_context = build_standing_context(project_root)
 
 # Conversation history is the chat turns in this session (user/assistant
 # messages). It is different from long-term memory: memory is durable

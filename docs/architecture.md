@@ -8,6 +8,7 @@ The first technical prototype **exists**. It is still a **deliberately small V1*
 
 - A Python application at `src/max_smart.py`
 - Session storage in `src/session.py` (`data/current_session.json`)
+- Standing-context loading in `src/context.py`
 - OpenAI GPT-5.6 Sol via the Responses API
 - Secure API-key loading from `.env`
 - Max Smart's standing instructions loaded from `docs/max-smart-instructions.md`
@@ -217,7 +218,7 @@ We describe this now so we do not accidentally build a “helpful” script with
 
 ## 9. The first technical version
 
-V1 **now exists** as `src/max_smart.py` plus `src/session.py`. It is still a deliberately small prototype.
+V1 **now exists** as `src/max_smart.py`, `src/session.py`, and `src/context.py`. It is still a deliberately small prototype.
 
 V1 currently:
 
@@ -267,11 +268,13 @@ The history file lives on Adam's machine, but each turn is still sent to OpenAI 
 
 `docs/memory.md` remains separate: curated long-term memory, manually controlled by Adam, and read-only to Max. Conversation history is not that memory file.
 
-**Modules (session storage slice)**
+**Current modules**
 
 `src/session.py` owns loading and saving `data/current_session.json`: JSON structure `{"messages": [...]}`, validation of the top-level object, messages list, roles, and text content, and reporting invalid JSON or invalid UTF-8 via `SessionLoadError`. A failed load never deletes, resets, or overwrites the file.
 
-`src/max_smart.py` still owns the R/N/Q startup menu, Terminal interaction, loading standing instructions / goals / read-only memory, the OpenAI Responses API request with `store=False`, and saving the session after a successful response. Context loading and model-request logic have not been extracted.
+`src/context.py` provides `build_standing_context(project_root)`. It reads `docs/max-smart-instructions.md`, `docs/goals.md`, and `docs/memory.md` in the original order and assembles them with the original labels and separators. It does not write to `docs/memory.md`.
+
+`src/max_smart.py` still owns the R/N/Q startup menu, Terminal interaction, the OpenAI Responses API request with `store=False`, and saving the session after a successful response. Context loading has been extracted; model-request and Terminal logic have not.
 
 **Startup**
 
@@ -803,3 +806,11 @@ Max Smart V1.1 resumable conversation has been verified:
 - The saved session backup was restored and validated as JSON.
 
 After extracting session storage into `src/session.py`, that behaviour was regression-tested: resume, new conversation, quit without modifying the session file, malformed JSON handling, and invalid UTF-8 handling. The valid session file was restored and verified after the damaged-file tests.
+
+After extracting standing-context loading into `src/context.py`, the following checks passed:
+
+- Python compilation.
+- Whitespace check.
+- Context-integrity assertions confirming the original files, order, labels, separators, and content remain in the assembled context.
+- `docs/memory.md` remained unchanged.
+- A successful live response after resuming a saved session.
