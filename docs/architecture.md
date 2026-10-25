@@ -18,6 +18,7 @@ The first technical prototype **exists**. It is still a **deliberately small V1*
 - A simple interactive Terminal conversation
 - Terminal input: normal single-line messages; `/multi` to enter multiline input; `/send` to submit the multiline message as one user message; `/cancel` to discard a multiline draft
 - Resumable conversation history saved locally in `data/current_session.json` (see section 9A)
+- A standard-library `unittest` regression suite in `tests/`
 
 The multiline Terminal input has been successfully tested and confirmed to deliver a large pasted prompt as a single message to Max Smart.
 
@@ -829,3 +830,17 @@ After extracting the OpenAI Responses API request into `src/model_client.py`, th
 - Successful live response.
 - Session-save verification after the successful response.
 - Independent Sonnet code review, with no issues that must be fixed.
+
+The automated regression-test milestone is now complete. The standard-library
+`unittest` suite runs with:
+
+`python3 -B -m unittest discover -s tests -v`
+
+The latest run passed all 10 tests across session storage, standing-context
+assembly, and model-request handling:
+
+- Session tests cover the exact `data/current_session.json` filename; missing-session behaviour without creating the data directory or session file; Unicode save/load round-tripping; malformed JSON; invalid UTF-8; invalid session structures; `OSError` handling; stable user-facing error-message fragments; and preservation of damaged files.
+- Context tests use temporary files to verify source ordering and exact assembly, including the labels, separators, read-only memory disclaimer, and preservation of leading and trailing whitespace and newlines in all three source documents.
+- Model-client tests use mocks to verify the exact request arguments — `model="gpt-5.6-sol"`, the unmodified `instructions` and `input`, and `store=False` — direct preservation of `response.output_text`, and exception propagation without retry.
+- The suite uses temporary directories and mocks, makes no live API calls, requires no API key or `.env`, and does not touch the real session file or source Markdown documents.
+- The latest test run passed all 10 tests, and `git diff --check` was clean.
