@@ -7,6 +7,7 @@ The first technical prototype **exists**. It is still a **deliberately small V1*
 **What we have implemented:**
 
 - A Python application at `src/max_smart.py`
+- Session storage in `src/session.py` (`data/current_session.json`)
 - OpenAI GPT-5.6 Sol via the Responses API
 - Secure API-key loading from `.env`
 - Max Smart's standing instructions loaded from `docs/max-smart-instructions.md`
@@ -216,7 +217,7 @@ We describe this now so we do not accidentally build a “helpful” script with
 
 ## 9. The first technical version
 
-V1 **now exists** as `src/max_smart.py`. It is still a deliberately small prototype.
+V1 **now exists** as `src/max_smart.py` plus `src/session.py`. It is still a deliberately small prototype.
 
 V1 currently:
 
@@ -265,6 +266,12 @@ The app no longer relies on `previous_response_id`. Each request sends the exist
 The history file lives on Adam's machine, but each turn is still sent to OpenAI for model processing. This is not a local-only model.
 
 `docs/memory.md` remains separate: curated long-term memory, manually controlled by Adam, and read-only to Max. Conversation history is not that memory file.
+
+**Modules (session storage slice)**
+
+`src/session.py` owns loading and saving `data/current_session.json`: JSON structure `{"messages": [...]}`, validation of the top-level object, messages list, roles, and text content, and reporting invalid JSON or invalid UTF-8 via `SessionLoadError`. A failed load never deletes, resets, or overwrites the file.
+
+`src/max_smart.py` still owns the R/N/Q startup menu, Terminal interaction, loading standing instructions / goals / read-only memory, the OpenAI Responses API request with `store=False`, and saving the session after a successful response. Context loading and model-request logic have not been extracted.
 
 **Startup**
 
@@ -794,3 +801,5 @@ Max Smart V1.1 resumable conversation has been verified:
 - A malformed JSON session file was detected; Max reported that the file had not been changed and exited.
 - A session file containing invalid UTF-8 was detected; a clear error was displayed and the file was left unchanged.
 - The saved session backup was restored and validated as JSON.
+
+After extracting session storage into `src/session.py`, that behaviour was regression-tested: resume, new conversation, quit without modifying the session file, malformed JSON handling, and invalid UTF-8 handling. The valid session file was restored and verified after the damaged-file tests.

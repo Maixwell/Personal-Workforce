@@ -6,12 +6,13 @@ then loops: you type, Max replies. Chat turns are saved locally so a
 session can be resumed after restart.
 """
 
-import json
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from session import SessionLoadError, load_session_messages, save_session_messages
 
 # --- 1. Load the secret API key from the project .env file ---
 # The key stays out of the code. Path is relative to this file so
@@ -64,69 +65,8 @@ standing_context = (
 
 # Conversation history is the chat turns in this session (user/assistant
 # messages). It is different from long-term memory: memory is durable
-# facts Adam chose to keep in docs/memory.md; history is what was said
-# in this conversation and is stored only in data/current_session.json.
-session_path = project_root / "data" / "current_session.json"
-
-
-def load_session_messages():
-    """Return saved messages, or None if there is no session file.
-
-    A missing file means a new conversation. A file that exists but
-    cannot be read is an error — we do not delete or overwrite it.
-    """
-    if not session_path.exists():
-        return None
-
-    try:
-        data = json.loads(session_path.read_text(encoding="utf-8"))
-    except OSError as error:
-        raise SystemExit(
-            f"Could not read {session_path}. The file was not changed.\n"
-            f"Fix or move it, then start again.\n({error})"
-        ) from error
-    except UnicodeDecodeError as error:
-        raise SystemExit(
-            f"{session_path} cannot be decoded as UTF-8. The file was not changed.\n"
-            f"Fix or move it, then start again.\n({error})"
-        ) from error
-    except json.JSONDecodeError as error:
-        raise SystemExit(
-            f"{session_path} is not valid JSON. The file was not changed.\n"
-            f"Fix or move it, then start again.\n({error})"
-        ) from error
-
-    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
-        raise SystemExit(
-            f"{session_path} is missing a messages list. "
-            "The file was not changed. Fix or move it, then start again."
-        )
-
-    messages = data["messages"]
-    for message in messages:
-        role_ok = isinstance(message, dict) and message.get("role") in (
-            "user",
-            "assistant",
-        )
-        content_ok = isinstance(message, dict) and isinstance(
-            message.get("content"), str
-        )
-        if not role_ok or not content_ok:
-            raise SystemExit(
-                f"{session_path} has an invalid message. "
-                "The file was not changed. Fix or move it, then start again."
-            )
-    return messages
-
-
-def save_session_messages(messages):
-    """Write the current conversation to data/current_session.json."""
-    session_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"messages": messages}
-    session_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+# facts Adam chose to keep in docs/memory.md; history is stored in
+# data/current_session.json via src/session.py.
 
 
 def choose_session(existing_messages):
@@ -140,7 +80,7 @@ def choose_session(existing_messages):
         if choice == "R":
             return existing_messages
         if choice == "N":
-            save_session_messages([])
+            save_session_messages(project_root, [])
             return []
         if choice == "Q":
             raise SystemExit("Goodbye.")
@@ -184,7 +124,12 @@ def read_user_message():
 
 
 # --- 6. Conversation loop ---
-messages = choose_session(load_session_messages())
+try:
+    existing_messages = load_session_messages(project_root)
+except SessionLoadError as error:
+    raise SystemExit(str(error)) from error
+
+messages = choose_session(existing_messages)
 
 print("Max Smart V1.1. Type a message, type /multi for several lines, or type exit to quit.")
 print()
@@ -217,7 +162,7 @@ while True:
 
     messages.append({"role": "user", "content": user_message})
     messages.append({"role": "assistant", "content": assistant_text})
-    save_session_messages(messages)
+    save_session_messages(project_root, messages)
 
     print()
     print("Max Smart:")
