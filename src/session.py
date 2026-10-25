@@ -5,6 +5,8 @@ History lives in data/current_session.json. This is not long-term memory
 """
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -71,9 +73,64 @@ def load_session_messages(project_root):
 def save_session_messages(project_root, messages):
     """Write the current conversation to data/current_session.json."""
     path = session_path(project_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    directory = path.parent
+
+    if directory.is_symlink():
+        raise OSError(
+            f"Refusing to save the session because {directory} is a symbolic link."
+        )
+
+    directory.mkdir(parents=True, exist_ok=True)
+
+    if directory.is_symlink():
+        raise OSError(
+            f"Refusing to save the session because {directory} is a symbolic link."
+        )
+
+    os.chmod(directory, 0o700)
+
+    if path.is_symlink():
+        raise OSError(
+            f"Refusing to save the session because {path} is a symbolic link."
+        )
+
     payload = {"messages": messages}
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+    file_descriptor = None
+    temporary_path = None
+    try:
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=directory,
+        )
+        temporary_path = Path(temporary_name)
+
+        if hasattr(os, "fchmod"):
+            os.fchmod(file_descriptor, 0o600)
+        else:
+            os.chmod(temporary_path, 0o600)
+
+        temporary_file = os.fdopen(file_descriptor, "w", encoding="utf-8")
+        file_descriptor = None
+        with temporary_file:
+            temporary_file.write(serialized)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        if path.is_symlink():
+            raise OSError(
+                f"Refusing to save the session because {path} is a symbolic link."
+            )
+
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass

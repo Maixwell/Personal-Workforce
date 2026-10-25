@@ -262,7 +262,7 @@ The multiline Terminal input has been successfully tested and confirmed to deliv
 
 **Conversation history (V1.1)**
 
-History is saved locally in `data/current_session.json` as a JSON object with a `messages` list. Each message has a `role` (`user` or `assistant`) and text `content`. The `data` directory is created when needed. `.gitignore` excludes `data/current_session.json` from Git.
+History is saved locally in `data/current_session.json` as a JSON object with a `messages` list. Each message has a `role` (`user` or `assistant`) and text `content`. The `data` directory is created when needed. `.gitignore` excludes `data/current_session.json` and stale atomic-write files matching `data/.current_session.json.*.tmp`. It does not ignore the rest of `data/`.
 
 The app no longer relies on `previous_response_id`. Each request sends the existing standing instructions (`instructions`) and the full saved message history plus the new user message (`input`) to the OpenAI Responses API, with `store=False`. After a successful API response, the user message and Max's text reply are appended to the local session file.
 
@@ -272,7 +272,7 @@ The history file lives on Adam's machine, but each turn is still sent to OpenAI 
 
 **Current modules**
 
-`src/session.py` owns loading and saving `data/current_session.json`: JSON structure `{"messages": [...]}`, validation of the top-level object, messages list, roles, and text content, and reporting invalid JSON or invalid UTF-8 via `SessionLoadError`. A failed load never deletes, resets, or overwrites the file.
+`src/session.py` owns loading and saving `data/current_session.json`: JSON structure `{"messages": [...]}`, validation of the top-level object, messages list, roles, and text content, and reporting invalid JSON or invalid UTF-8 via `SessionLoadError`. A failed load never deletes, resets, or overwrites the file. On POSIX, saving restricts the session directory to mode 700 and the session file to mode 600. It writes a temporary file in that directory, flushes and `fsync`s it, then replaces the session with `os.replace`. A failed save removes its temporary file and leaves an existing session unchanged. Symbolic links at either the session file or the `data` directory are rejected.
 
 `src/context.py` provides `build_standing_context(project_root)`. It reads `docs/max-smart-instructions.md`, `docs/goals.md`, and `docs/memory.md` in the original order and assembles them with the original labels and separators. It does not write to `docs/memory.md`.
 
@@ -844,3 +844,23 @@ assembly, and model-request handling:
 - Model-client tests use mocks to verify the exact request arguments — `model="gpt-5.6-sol"`, the unmodified `instructions` and `input`, and `store=False` — direct preservation of `response.output_text`, and exception propagation without retry.
 - The suite uses temporary directories and mocks, makes no live API calls, requires no API key or `.env`, and does not touch the real session file or source Markdown documents.
 - The latest test run passed all 10 tests, and `git diff --check` was clean.
+
+### Current milestone — session-write hardening
+
+Session saving now hardens the local history file without changing its JSON format or the public loading behaviour:
+
+- On POSIX, `data/` is mode 700 and `data/current_session.json` is mode 600, including when an existing session is replaced. These modes are set explicitly rather than inherited from the process umask.
+- `save_session_messages()` creates a temporary file in the same directory, writes the complete JSON, flushes and `fsync`s it, and only then uses `os.replace`. If saving fails, the temporary file is removed and an existing session remains byte-for-byte unchanged.
+- A symbolic link at `data/current_session.json` or at the `data/` directory is rejected before the session is replaced.
+- `.gitignore` contains the narrow rule `data/.current_session.json.*.tmp`, so a stale temporary file is not accidentally staged. The existing `data/current_session.json` rule remains, and the rest of `data/` is not ignored.
+
+The standard-library suite now contains 16 tests. Its session coverage includes permission enforcement under umask `0o277`, atomic replacement, simulated `os.replace` and `os.fsync` failures, exact directory-listing cleanup checks, file-symlink and directory-symlink rejection, JSON formatting, Unicode preservation, and preservation of damaged files. The tests use temporary directories and do not touch the real session or personal documents.
+
+The latest independent Sonnet review found no blockers. All 16 tests passed in that review environment. Before this documentation update, the Mac run of `python3 -B -m unittest discover -s tests -v` passed all 16 tests, and `git diff --check` was clean.
+
+Limitations of this hardening:
+
+- The tests were run on macOS, not Windows. POSIX mode checks do not establish Windows ACL behaviour.
+- Flushing and `fsync`ing the temporary file does not fully guarantee durability across power loss. The parent directory is not `fsync`ed after replacement.
+- Same-user filesystem race conditions are reduced, particularly because replacement does not write through a session-file symlink, but they are not completely eliminated.
+- A temporary file left by a hard crash is ignored by Git, but nothing automatically sweeps it.
