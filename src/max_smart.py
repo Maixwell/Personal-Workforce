@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from context import build_standing_context
+from model_client import get_model_response
 from session import SessionLoadError, load_session_messages, save_session_messages
 
 # --- 1. Load the secret API key from the project .env file ---
@@ -121,14 +122,7 @@ while True:
     # earlier turns unless we include them here (store=False, no response ids).
     api_input = messages + [{"role": "user", "content": user_message}]
 
-    response = client.responses.create(
-        model="gpt-5.6-sol",
-        instructions=standing_context,
-        input=api_input,
-        store=False,
-    )
-
-    assistant_text = response.output_text
+    assistant_text = get_model_response(client, standing_context, api_input)
 
     messages.append({"role": "user", "content": user_message})
     messages.append({"role": "assistant", "content": assistant_text})

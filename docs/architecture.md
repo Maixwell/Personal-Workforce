@@ -9,6 +9,7 @@ The first technical prototype **exists**. It is still a **deliberately small V1*
 - A Python application at `src/max_smart.py`
 - Session storage in `src/session.py` (`data/current_session.json`)
 - Standing-context loading in `src/context.py`
+- OpenAI Responses API request handling in `src/model_client.py`
 - OpenAI GPT-5.6 Sol via the Responses API
 - Secure API-key loading from `.env`
 - Max Smart's standing instructions loaded from `docs/max-smart-instructions.md`
@@ -218,7 +219,7 @@ We describe this now so we do not accidentally build a “helpful” script with
 
 ## 9. The first technical version
 
-V1 **now exists** as `src/max_smart.py`, `src/session.py`, and `src/context.py`. It is still a deliberately small prototype.
+V1 **now exists** as `src/max_smart.py`, `src/session.py`, `src/context.py`, and `src/model_client.py`. It is still a deliberately small prototype.
 
 V1 currently:
 
@@ -274,7 +275,9 @@ The history file lives on Adam's machine, but each turn is still sent to OpenAI 
 
 `src/context.py` provides `build_standing_context(project_root)`. It reads `docs/max-smart-instructions.md`, `docs/goals.md`, and `docs/memory.md` in the original order and assembles them with the original labels and separators. It does not write to `docs/memory.md`.
 
-`src/max_smart.py` still owns the R/N/Q startup menu, Terminal interaction, the OpenAI Responses API request with `store=False`, and saving the session after a successful response. Context loading has been extracted; model-request and Terminal logic have not.
+`src/model_client.py` provides `get_model_response(client, standing_context, api_input)`. It calls the OpenAI Responses API with `model="gpt-5.6-sol"`, `instructions=standing_context`, `input=api_input`, and `store=False`, then returns `response.output_text` directly. API exceptions propagate as before; this module adds no retries or new exception handling.
+
+`src/max_smart.py` still owns API-key loading, `.env` handling, OpenAI client construction, the R/N/Q startup menu, Terminal interaction, the context-loading call, the conversation loop, session handling, and saving the session after a successful response. Context loading and model-request execution have been extracted; Terminal and orchestration logic have not. `src/session.py` and `src/context.py` retain the responsibilities described above.
 
 **Startup**
 
@@ -293,6 +296,8 @@ The history file lives on Adam's machine, but each turn is still sent to OpenAI 
 - Conversation history is separate from curated long-term memory.
 - Max cannot modify `docs/memory.md`.
 - No tools, external actions, integrations, additional agents, or background operation have been added by this change.
+- The current imports support launching with `python3 src/max_smart.py`; package-style imports may need attention before introducing a web backend.
+- API errors currently propagate. If a request fails, the new user message is not added to the session file because saving occurs only after a successful response. Slice 3 does not change this behaviour.
 
 ---
 
@@ -814,3 +819,13 @@ After extracting standing-context loading into `src/context.py`, the following c
 - Context-integrity assertions confirming the original files, order, labels, separators, and content remain in the assembled context.
 - `docs/memory.md` remained unchanged.
 - A successful live response after resuming a saved session.
+
+After extracting the OpenAI Responses API request into `src/model_client.py`, the following checks passed:
+
+- Python syntax.
+- Exact request-contract check for the model, instructions, input, and `store=False`.
+- Whitespace check.
+- IDE lint check.
+- Successful live response.
+- Session-save verification after the successful response.
+- Independent Sonnet code review, with no issues that must be fixed.
