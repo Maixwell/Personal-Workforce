@@ -4,23 +4,29 @@ This document is a **living design** for Max Smart: how the system works now, an
 
 The first technical prototype **exists**. It is still a **deliberately small V1** — a conversational Chief of Staff, not a workforce, not always-on, and not connected to email, calendars, or other personal systems.
 
+As of `481c5b6`, the current implementation has a provider-independent Application Engine and a separate Terminal interface.
+
 **What we have implemented:**
 
-- A Python application at `src/max_smart.py`
-- Session storage in `src/session.py` (`data/current_session.json`)
-- Standing-context loading in `src/context.py`
-- OpenAI Responses API request handling in `src/model_client.py`
+- A composition root and dependency wiring in `src/max_smart.py`
+- A provider-independent conversation engine in `src/application.py`
+- A separate interactive interface in `src/terminal.py`
+- OpenAI Responses API adaptation in `src/model_client.py`
+- Standing-context assembly in `src/context.py`
+- Secure local session persistence in `src/session.py`
 - OpenAI GPT-5.6 Sol via the Responses API
-- Secure API-key loading from `.env`
+- OpenAI client construction with SDK retries disabled (`max_retries=0`)
+- API-key loading from the local `.env` file into the process environment.
 - Max Smart's standing instructions loaded from `docs/max-smart-instructions.md`
 - Adam's goals loaded from the local-only file `docs/goals.md`
 - File-based long-term memory loaded from the local-only file `docs/memory.md`
-- A simple interactive Terminal conversation
-- Terminal input: normal single-line messages; `/multi` to enter multiline input; `/send` to submit the multiline message as one user message; `/cancel` to discard a multiline draft
-- Resumable conversation history saved locally in `data/current_session.json` (see section 9A)
-- A standard-library `unittest` regression suite in `tests/`
+- Normal and multiline Terminal input, resumable history, and explicit model/save retry choices
+- Domain-specific failure handling that redacts provider errors from Terminal output
+- POSIX permissions, atomic replacement, cleanup, and save-time symlink rejection for session writes
+- A standard-library `unittest` regression suite with 64 passing tests at this milestone
+- The current model decision in `docs/model-decision.md`
 
-The multiline Terminal input has been successfully tested and confirmed to deliver a large pasted prompt as a single message to Max Smart.
+The job and approval boundaries remain defined in `docs/chief-of-staff-blueprint.md`. Personal context and conversation history are stored locally, but relevant context is sent to OpenAI for model processing. `store=False` is configured on each request; it is not a promise about all provider logging or retention.
 
 Max Smart is Adam's Chief of Staff. Cursor remains the development environment. The Python program is the current way Adam talks to Max Smart.
 
@@ -222,7 +228,14 @@ We describe this now so we do not accidentally build a “helpful” script with
 
 ## 9. The first technical version
 
-V1 **now exists** as `src/max_smart.py`, `src/session.py`, `src/context.py`, and `src/model_client.py`. It is still a deliberately small prototype.
+V1 **now exists** as six modules with explicit boundaries:
+
+- `src/max_smart.py` — composition root and concrete dependency wiring.
+- `src/application.py` — provider-independent conversation engine.
+- `src/terminal.py` — all Terminal input, output, menus, commands, and retry prompts.
+- `src/model_client.py` — OpenAI Responses API adapter.
+- `src/context.py` — standing-context assembly.
+- `src/session.py` — local conversation-session loading and secure persistence.
 
 V1 currently:
 
@@ -231,10 +244,11 @@ V1 currently:
 3. Reads Max's file-based long-term memory.
 4. Accepts interactive messages in the Terminal (single-line, plus `/multi` / `/send` / `/cancel` for a pasted block sent as one user message).
 5. Saves and resumes conversation history locally (details in section 9A).
-6. Sends standing instructions, the full saved message history, and the new user message to GPT-5.6 Sol through the OpenAI Responses API (`store=False`).
-7. Prints Max Smart's response.
-8. Takes no consequential external actions.
-9. Has no tools, external integrations, autonomous execution, databases, or multi-agent orchestration.
+6. Sends standing instructions as `instructions` and the full saved history plus the new user message as `input` to GPT-5.6 Sol through the OpenAI Responses API.
+7. Sets `store=False` on the request and constructs the OpenAI client with `max_retries=0`.
+8. Requires explicit user choices before retrying a failed model request or failed save.
+9. Persists a successful user/assistant turn before displaying the assistant response.
+10. Takes no consequential external actions and has no tools, integrations, autonomous execution, databases, or multi-agent orchestration.
 
 V1 exists primarily to **prove the conversational core** and **teach the architecture**. It is not a product, not a workforce, and not always-on. If this loop is not useful, we do not add tools to compensate.
 
@@ -253,34 +267,62 @@ V1 exists primarily to **prove the conversational core** and **teach the archite
 - Model: GPT-5.6 Sol
 - API: OpenAI Responses API
 
-The Terminal interface now supports:
+**Module boundaries**
+
+`src/max_smart.py` identifies the project root, loads `.env`, reads `OPENAI_API_KEY`, creates the OpenAI client, builds concrete model and save callbacks, loads the session, constructs `MaxSmartApplication`, and starts the Terminal. `load_dotenv()` places the key in the process environment, where code in that process can read it and child processes may inherit it unless filtered. The composition root reads the key to construct the client; the key is not passed to or referenced by the Application Engine or Terminal interface.
+
+`src/application.py` owns conversation state and orchestration. It receives provider-neutral `request_model` and path-free `save_messages` callables. It imports only standard-library modules and knows nothing about OpenAI, credentials, personal files, the Terminal, project paths, or session-file format.
+
+`src/terminal.py` owns all human interaction:
 
 - normal single-line messages
 - `/multi` to enter multiline input
 - `/send` to submit the multiline message as one user message
 - `/cancel` to discard a multiline draft
+- `exit` to quit at the normal prompt
+- Resume (`R`), New (`N`), and Quit (`Q`) at startup when a session exists
+- Retry (`R`) or Cancel (`C`) after a model failure
+- Save retry (`S`) or Quit (`Q`) after a persistence failure
 
 The multiline Terminal input has been successfully tested and confirmed to deliver a large pasted prompt as a single message to Max Smart.
 
-**Conversation history (V1.1)**
+`src/model_client.py` makes one Responses API call with `model="gpt-5.6-sol"`, the assembled standing context as `instructions`, conversation history plus the current message as `input`, and `store=False`. It returns `response.output_text` and does not catch or retry provider exceptions. The OpenAI client is created by the composition root with `max_retries=0`, so there are no hidden SDK retries.
+
+`src/context.py` reads `docs/max-smart-instructions.md`, `docs/goals.md`, and `docs/memory.md` in that order and assembles them with explicit labels. Goals and memory are local-only and ignored by Git. Max reads but does not write them.
+
+`src/session.py` owns loading and saving `data/current_session.json`.
+
+**Application states and operations**
+
+The Application Engine has three mutually exclusive states:
+
+- **Idle** — only successfully saved history is committed. `submit_message()` may perform one model request.
+- **Pending** — one user message is held in memory after a `ModelRequestError`. `retry_pending()` performs one new model request for the same message; `cancel_pending()` discards it without requesting or saving.
+- **Unsaved** — the model succeeded but persistence raised `SessionSaveError`. The proposed history and assistant response are held in memory. `retry_save()` retries only that snapshot and never calls the model.
+
+Each operation makes at most one model request and at most one save attempt. Repeated attempts require a new explicit Terminal choice. A successful turn is committed in memory only after its complete user/assistant snapshot has been saved. This is an application-level guarantee for the current single-process design, not a network exactly-once guarantee.
+
+`ModelRequestError` and `SessionSaveError` represent expected boundary failures. The composition root converts OpenAI `APIError` and session-save `OSError` respectively into generic domain errors with suppressed exception chaining. Sensitive provider details are not printed through the normal Terminal flow. Unexpected programming errors propagate rather than being reclassified.
+
+The engine copies message dictionaries at its boundaries: initial history, the public history property, model and save callbacks, and committed snapshots. Callers and callbacks therefore cannot mutate engine-owned history through retained list or dictionary references.
+
+**Conversation history and persistence**
 
 History is saved locally in `data/current_session.json` as a JSON object with a `messages` list. Each message has a `role` (`user` or `assistant`) and text `content`. The `data` directory is created when needed. `.gitignore` excludes `data/current_session.json` and stale atomic-write files matching `data/.current_session.json.*.tmp`. It does not ignore the rest of `data/`.
 
-The app no longer relies on `previous_response_id`. Each request sends the existing standing instructions (`instructions`) and the full saved message history plus the new user message (`input`) to the OpenAI Responses API, with `store=False`. After a successful API response, the user message and Max's text reply are appended to the local session file.
+On save, `data/` is set to POSIX mode 700 and the session file to mode 600. The complete JSON payload is written to a temporary file in the same directory, flushed, `fsync`ed, and atomically installed with `os.replace`. Ordinary failures clean up the temporary file and preserve an existing session. Saving rejects a symbolic link at either the data directory or session path. Loading currently follows symbolic links; symlink rejection is a save-time control. The parent directory is not `fsync`ed after replacement, so this is not a complete guarantee against every power-loss scenario.
 
-The history file lives on Adam's machine, but each turn is still sent to OpenAI for model processing. This is not a local-only model.
+Loading validates UTF-8, JSON structure, roles, and string content. A missing file means no saved session. An invalid or unreadable session raises `SessionLoadError` without changing the file; its startup message may include the path and operating-system error details.
+
+The app does not use `previous_response_id`. Each model operation sends the standing context and a copy of the saved history plus the current user message to OpenAI. The history and personal context are stored locally, but relevant content leaves the device for model processing. `store=False` is a request setting, not a general promise about provider logging or retention.
 
 `docs/memory.md` remains separate: curated long-term memory, manually controlled by Adam, and read-only to Max. Conversation history is not that memory file.
 
-**Current modules**
+**Failure behaviour**
 
-`src/session.py` owns loading and saving `data/current_session.json`: JSON structure `{"messages": [...]}`, validation of the top-level object, messages list, roles, and text content, and reporting invalid JSON or invalid UTF-8 via `SessionLoadError`. A failed load never deletes, resets, or overwrites the file. On POSIX, saving restricts the session directory to mode 700 and the session file to mode 600. It writes a temporary file in that directory, flushes and `fsync`s it, then replaces the session with `os.replace`. A failed save removes its temporary file and leaves an existing session unchanged. Symbolic links at either the session file or the `data` directory are rejected.
-
-`src/context.py` provides `build_standing_context(project_root)`. It reads `docs/max-smart-instructions.md`, `docs/goals.md`, and `docs/memory.md` in the original order and assembles them with the original labels and separators. It does not write to `docs/memory.md`. The goals and memory paths are unchanged, but both files are now local-only and ignored by Git. A fresh checkout must create them from `docs/goals.example.md` and `docs/memory.example.md` before Max can start.
-
-`src/model_client.py` provides `get_model_response(client, standing_context, api_input)`. It calls the OpenAI Responses API with `model="gpt-5.6-sol"`, `instructions=standing_context`, `input=api_input`, and `store=False`, then returns `response.output_text` directly. API exceptions propagate as before; this module adds no retries or new exception handling.
-
-`src/max_smart.py` still owns API-key loading, `.env` handling, OpenAI client construction, the R/N/Q startup menu, Terminal interaction, the context-loading call, the conversation loop, session handling, and saving the session after a successful response. Context loading and model-request execution have been extracted; Terminal and orchestration logic have not. `src/session.py` and `src/context.py` retain the responsibilities described above.
+- A model failure does not save the user message. `R` retries once; `C` discards the pending message. Another failure requires another choice.
+- A save failure does not expose the assistant response. `S` retries only the save; `Q` warns that the unsaved response will be lost and exits. Pending and Unsaved data exist only in process memory.
+- Ctrl+C and Ctrl+D are not handled and may terminate Terminal interaction with a traceback.
 
 **Startup**
 
@@ -292,15 +334,37 @@ The history file lives on Adam's machine, but each turn is still sent to OpenAI 
 - Invalid menu input prompts the user again.
 - A malformed or unreadable session file produces an error and exits without silently deleting or overwriting the file.
 
-**Limitations (this change)**
+**Security boundaries**
 
+`.env`, `docs/goals.md`, `docs/memory.md`, and `data/current_session.json` are ignored by Git. Ignore rules reduce accidental commits; they are not encryption or access control. Personal and professional AI data must remain separate. No employer, customer, regulated, or otherwise restricted data should enter this personal system.
+
+No consequential-action tools exist. Any future capability that communicates externally, changes data, spends money, creates commitments, grants access, or performs hard-to-reverse work must have a narrow permission boundary, present the proposed action, require explicit approval, avoid implied consent, and be auditable. Prompt instructions alone are not a security boundary.
+
+**Testing**
+
+The standard-library suite currently has 64 passing tests. This is a milestone snapshot and will change as tests are added. Tests use mocks and temporary directories and make no live model API calls. They cover engine states and copying, explicit retry contracts, error redaction, request configuration, Terminal behaviour, composition wiring, context assembly, and secure session persistence.
+
+Install and run the separate dependency-audit tool with:
+
+`python -m pip install pip-audit==2.10.1`
+
+`pip-audit --require-hashes --disable-pip -r requirements-lock.txt`
+
+**Current limitations**
+
+- The application is synchronous and one operation blocks the Terminal.
+- The engine and session storage are single-process; no concurrent web, desktop, or mobile sessions are supported.
 - Only one saved conversation is supported at present.
 - Starting a new conversation replaces the saved session.
+- Pending messages and unsaved turns are held only in memory.
+- Quitting after an unsaved response loses that response.
+- There is no web, desktop, or mobile interface and no authentication or authorization layer.
 - Conversation history is separate from curated long-term memory.
 - Max cannot modify `docs/memory.md`.
-- No tools, external actions, integrations, additional agents, or background operation have been added by this change.
-- The current imports support launching with `python3 src/max_smart.py`; package-style imports may need attention before introducing a web backend.
-- API errors currently propagate. If a request fails, the new user message is not added to the session file because saving occurs only after a successful response. Slice 3 does not change this behaviour.
+- No tools, external actions, integrations, additional agents, databases, or background operation are implemented.
+- Session and personal-context files are not application-level encrypted.
+- A failure while resetting the session during the startup New flow is not presented through the normal save-retry interface.
+- No professional, employer, customer, or other restricted data should enter this personal system.
 
 ---
 
@@ -866,3 +930,30 @@ Limitations of this hardening:
 - Flushing and `fsync`ing the temporary file does not fully guarantee durability across power loss. The parent directory is not `fsync`ed after replacement.
 - Same-user filesystem race conditions are reduced, particularly because replacement does not write through a session-file symlink, but they are not completely eliminated.
 - A temporary file left by a hard crash is ignored by Git, but nothing automatically sweeps it.
+
+### Current milestone — Application Engine and Terminal extraction — 2026-10-31
+
+The conversation workflow has been separated into a provider-independent Application Engine and a Terminal interface:
+
+- `src/application.py` now owns Idle, Pending, and Unsaved conversation state.
+- Each application operation performs at most one model request or one save attempt.
+- Model retries require an explicit `R` choice; cancellation requires `C`.
+- Save retries require an explicit `S` choice, never call the model again, and preserve the same proposed snapshot.
+- Quitting with `Q` after a save failure warns that the in-memory response will be lost.
+- Message lists and dictionaries are copied at engine boundaries so callbacks and callers cannot mutate engine-owned state.
+- `ModelRequestError` and `SessionSaveError` provide narrow, provider-independent failure contracts.
+- Expected OpenAI errors are converted to generic messages without exposing provider details.
+- The OpenAI client disables SDK automatic retries with `max_retries=0`.
+- `src/terminal.py` owns menus, commands, prompts, retry choices, output, and the conversation loop.
+- The Terminal has no direct access to credentials, context assembly, project paths, provider APIs, or session storage.
+- `src/max_smart.py` is the composition root that wires the concrete model, context, storage, engine, and interface dependencies.
+
+The request contract remains `model="gpt-5.6-sol"`, assembled standing context as `instructions`, conversation history plus the current message as `input`, and `store=False`.
+
+The standard-library regression suite now contains 64 tests. The verified command is:
+
+`./.venv/bin/python -B -m unittest discover -s tests -v`
+
+The suite passed all 64 tests after the Application Engine and Terminal extraction, and `git diff --check` was clean. Tests use mocks and temporary directories; they require no real API key, make no live model requests, and do not touch the real session or personal context files.
+
+Current operational limitations remain: synchronous execution, one process and one saved session, no concurrent interfaces, in-memory Pending and Unsaved state, loss of an unsaved response on quit, no web interface or authentication layer, and no professional or customer data in this personal system.
