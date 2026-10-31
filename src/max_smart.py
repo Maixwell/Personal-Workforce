@@ -12,6 +12,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import APIError, OpenAI
 
+from application import (
+    MaxSmartApplication,
+    ModelRequestError,
+    SessionSaveError,
+    TurnStatus,
+)
 from context import build_standing_context
 from model_client import get_model_response
 from session import SessionLoadError, load_session_messages, save_session_messages
@@ -87,33 +93,70 @@ def user_wants_retry():
         print("Please type R or C.")
 
 
-def send_pending_message(client, standing_context, project_root, messages, user_message):
-    """Send one pending message, retrying only after an explicit user choice.
-
-    Expected API failures stay in this loop. The pending text remains only in
-    memory until a response succeeds. It is appended and saved together with
-    the assistant reply, and only after that success. Other exceptions propagate.
-    """
+def user_wants_save_retry():
+    """Ask whether to retry an unsaved response or quit."""
     while True:
-        api_input = messages + [{"role": "user", "content": user_message}]
+        choice = input("Retry saving (S) or quit (Q): ").strip().upper()
+        if choice == "S":
+            return True
+        if choice == "Q":
+            return False
+        print("Please type S or Q.")
+
+
+def create_model_request(client, standing_context):
+    """Create the engine's provider-neutral model request callable."""
+    def request_model(api_input):
         try:
-            assistant_text = get_model_response(client, standing_context, api_input)
+            return get_model_response(client, standing_context, api_input)
         except APIError:
+            raise ModelRequestError("The model request failed.") from None
+
+    return request_model
+
+
+def create_session_saver(project_root):
+    """Create the engine's path-free session-save callable."""
+    def save_messages(messages):
+        try:
+            save_session_messages(project_root, messages)
+        except OSError:
+            raise SessionSaveError("The conversation could not be saved.") from None
+
+    return save_messages
+
+
+def run_terminal_turn(application, user_message):
+    """Run one Terminal turn; return False only when the user chooses to quit."""
+    result = application.submit_message(user_message)
+
+    while True:
+        if result.status is TurnStatus.MODEL_REQUEST_FAILED:
             print("The model request failed. Your message was not saved.")
             if user_wants_retry():
-                continue
-            print("Cancelled. Your message was not saved.")
-            return messages
+                result = application.retry_pending()
+            else:
+                result = application.cancel_pending()
+            continue
 
-        messages.append({"role": "user", "content": user_message})
-        messages.append({"role": "assistant", "content": assistant_text})
-        save_session_messages(project_root, messages)
+        if result.status is TurnStatus.SAVE_FAILED:
+            print("The response was received, but the conversation could not be saved.")
+            if user_wants_save_retry():
+                result = application.retry_save()
+            else:
+                print("Quitting. The unsaved response will be lost.")
+                return False
+            continue
+
+        if result.status is TurnStatus.CANCELLED:
+            print("Cancelled. Your message was not saved.")
+            return True
 
         print()
         print("Max Smart:")
-        print(assistant_text)
+        print(result.assistant_text)
         print()
-        return messages
+        return True
 
 
 def create_openai_client(api_key):
@@ -143,6 +186,11 @@ def main():
         raise SystemExit(str(error)) from error
 
     messages = choose_session(project_root, existing_messages)
+    application = MaxSmartApplication(
+        create_model_request(client, standing_context),
+        create_session_saver(project_root),
+        messages,
+    )
 
     print("Max Smart V1.1. Type a message, type /multi for several lines, or type exit to quit.")
     print()
@@ -160,13 +208,8 @@ def main():
         if not user_message.strip():
             continue
 
-        messages = send_pending_message(
-            client,
-            standing_context,
-            project_root,
-            messages,
-            user_message,
-        )
+        if not run_terminal_turn(application, user_message):
+            break
 
 
 if __name__ == "__main__":
