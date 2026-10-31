@@ -12,7 +12,7 @@ from openai import APIConnectionError
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from max_smart import create_openai_client, send_pending_message  # noqa: E402
+from max_smart import create_openai_client, main, send_pending_message  # noqa: E402
 from session import load_session_messages, save_session_messages  # noqa: E402
 
 
@@ -42,6 +42,31 @@ class ApiFailureTests(unittest.TestCase):
             self.assertEqual(client.max_retries, 0)
         finally:
             client.close()
+
+    def test_main_uses_retry_free_client_factory(self):
+        client = Mock()
+
+        with patch("max_smart.load_dotenv") as load_dotenv, patch(
+            "max_smart.os.getenv", return_value="sk-test-not-real"
+        ), patch(
+            "max_smart.create_openai_client", return_value=client
+        ) as create_client, patch(
+            "max_smart.OpenAI", side_effect=AssertionError("main() bypassed create_openai_client")
+        ) as openai_constructor, patch(
+            "max_smart.build_standing_context", return_value="standing context"
+        ), patch(
+            "max_smart.load_session_messages", return_value=None
+        ), patch(
+            "max_smart.read_user_message", side_effect=["hello", "exit"]
+        ), patch(
+            "max_smart.send_pending_message", return_value=[]
+        ) as send_message, patch("builtins.print"):
+            main()
+
+        load_dotenv.assert_called_once()
+        create_client.assert_called_once_with("sk-test-not-real")
+        openai_constructor.assert_not_called()
+        self.assertIs(send_message.call_args.args[0], client)
 
     def test_api_error_is_handled_and_keeps_message_for_explicit_retry(self):
         client = Mock()
