@@ -33,7 +33,7 @@ from django.db import OperationalError, connection, connections
 from django.db.migrations.executor import MigrationExecutor
 from max_smart_db.creation import SqliteConversationRepository
 from max_smart_db.models import Conversation, GlobalModelSlot, Message, Operation
-from max_smart_db.repository import DefiniteProviderCategory
+from max_smart_db.repository import DefiniteProviderCategory, RetainedResult
 
 MigrationExecutor(connection).migrate(
     MigrationExecutor(connection).loader.graph.leaf_nodes()
@@ -388,6 +388,205 @@ class DurableOutcomeInspectionTests(unittest.TestCase):
             "provider_output_invalid",
         )
         self.assertEqual(payload["pre_provider"]["type"], "OutcomeNotProven")
+
+    def test_late_reconciliation_proves_a_later_message_clock(self):
+        result = _run(
+            """\
+            repo, clock, claimed = claim()
+            recovered = SqliteConversationRepository(
+                Clock(LEASE),
+                RUNNER,
+            ).recover_slot()
+            late, late_clock = repository(LEASE + 5)
+            reconciled = late.reconcile_late_success(
+                RetainedResult(
+                    claimed_operation=claimed,
+                    output_text="kept answer",
+                )
+            )
+            proof, clock_delta = inspect(
+                repo, OWNER.id, OPERATION, RUNNER, CLAIMED_AT,
+            )
+            created = list(
+                Message.objects.filter(operation_id=OPERATION)
+                .order_by("sequence")
+                .values_list("created_at_us", flat=True)
+            )
+            print(json.dumps({
+                "recovered": type(recovered).__name__,
+                "reconciled": type(reconciled).__name__,
+                "proof": proof,
+                "clock_delta": clock_delta,
+                "late_calls": late_clock.calls,
+                "finished": Operation.objects.get(pk=OPERATION).finished_at_us,
+                "created": created,
+                "observed": fresh(OPERATION),
+            }))
+            """
+        )
+        payload = _payload(self, result)
+        self.assertEqual(payload["recovered"], "MarkedOutcomeUnknown")
+        self.assertEqual(payload["reconciled"], "Reconciled")
+        self.assertEqual(payload["proof"]["type"], "DurableSuccessObserved")
+        self.assertEqual(
+            payload["proof"]["messages"][1][2],
+            "kept answer",
+        )
+        self.assertEqual(payload["clock_delta"], 0)
+        self.assertEqual(payload["late_calls"], 1)
+        self.assertEqual(payload["finished"], 720_123_456)
+        self.assertEqual(payload["created"], [720_123_461, 720_123_461])
+        self.assertEqual(payload["observed"]["messages"], 2)
+        self.assertEqual(payload["observed"]["version"], 1)
+        self.assertEqual(payload["observed"]["next_sequence"], 3)
+        self.assertEqual(payload["observed"]["operation"][0], "SUCCEEDED")
+
+    def test_ambiguous_late_reconciliation_commit_is_proven_once(self):
+        result = _run(
+            """\
+            repo, clock, claimed = claim()
+            SqliteConversationRepository(Clock(LEASE), RUNNER).recover_slot()
+            late, late_clock = repository(LEASE + 5)
+            real_commit = connection.commit
+
+            def commit(*args, **kwargs):
+                real_commit(*args, **kwargs)
+                raise OperationalError("simulated post-commit failure")
+
+            connection.commit = commit
+            try:
+                outcome = late.reconcile_late_success(
+                    RetainedResult(
+                        claimed_operation=claimed,
+                        output_text="kept answer",
+                    )
+                )
+            finally:
+                connection.commit = real_commit
+            proof, clock_delta = inspect(
+                repo, OWNER.id, OPERATION, RUNNER, CLAIMED_AT,
+            )
+            print(json.dumps({
+                "reconciled": type(outcome).__name__,
+                "proof": proof,
+                "clock_delta": clock_delta,
+                "late_calls": late_clock.calls,
+                "finished": Operation.objects.get(pk=OPERATION).finished_at_us,
+                "created": list(
+                    Message.objects.filter(operation_id=OPERATION)
+                    .order_by("sequence")
+                    .values_list("created_at_us", flat=True)
+                ),
+                "messages": Message.objects.count(),
+            }))
+            """
+        )
+        payload = _payload(self, result)
+        self.assertEqual(payload["reconciled"], "CommitAmbiguous")
+        self.assertEqual(payload["proof"]["type"], "DurableSuccessObserved")
+        self.assertEqual(payload["clock_delta"], 0)
+        self.assertEqual(payload["late_calls"], 1)
+        self.assertEqual(payload["finished"], 720_123_456)
+        self.assertEqual(payload["created"], [720_123_461, 720_123_461])
+        self.assertEqual(payload["messages"], 2)
+
+    def test_malformed_success_evidence_fails_closed(self):
+        result = _run(
+            """\
+            def plant(
+                identifier,
+                conversation,
+                roles=("user", "assistant"),
+                created=(LEASE + 5, LEASE + 5),
+                finished=LEASE,
+                version=1,
+                next_sequence=3,
+                message_conversation=None,
+                content="hello",
+                owner=OWNER.id,
+            ):
+                Conversation.objects.create(
+                    id=conversation,
+                    owner_id=owner,
+                    role_id="max-smart",
+                    version=version,
+                    next_sequence=next_sequence,
+                    title=None,
+                    created_at_us=0,
+                    updated_at_us=0,
+                )
+                Operation.objects.create(
+                    id=identifier,
+                    conversation_id=conversation,
+                    owner_id=owner,
+                    operation_type="message",
+                    provider_id="openai",
+                    model_id="gpt-5.6-sol",
+                    status="SUCCEEDED",
+                    blocks_conversation=0,
+                    expected_version=0,
+                    request_content="hello",
+                    fingerprint_version=1,
+                    request_hash=HASH,
+                    retry_of=None,
+                    runner_id=None,
+                    reservation_expires_at_us=None,
+                    provider_started_at_us=CLAIMED_AT,
+                    execution_deadline_us=DEADLINE,
+                    lease_expires_at_us=LEASE,
+                    created_at_us=1,
+                    finished_at_us=finished,
+                    acknowledged_at_us=None,
+                    failure_category=None,
+                )
+                home = conversation if message_conversation is None else message_conversation
+                for index, role in enumerate(roles):
+                    Message.objects.create(
+                        id=uuid.uuid4(),
+                        conversation_id=home,
+                        sequence=index + 1,
+                        role=role,
+                        content=content if role == "user" else "kept answer",
+                        operation_id=identifier,
+                        created_at_us=created[index],
+                    )
+
+            cases = (
+                ("order", uuid.UUID("01010101010101010101010101010101"), uuid.UUID("12121212121212121212121212121212"), {"roles": ("assistant", "user")}),
+                ("owner", uuid.UUID("13131313131313131313131313131313"), uuid.UUID("14141414141414141414141414141414"), {"owner": OTHER.id}),
+                ("version", uuid.UUID("15151515151515151515151515151515"), uuid.UUID("16161616161616161616161616161616"), {"version": 99}),
+                ("sequence", uuid.UUID("17171717171717171717171717171717"), uuid.UUID("18181818181818181818181818181818"), {"next_sequence": 4}),
+                ("early", uuid.UUID("19191919191919191919191919191919"), uuid.UUID("20202020202020202020202020202020"), {"created": (LEASE - 1, LEASE - 1)}),
+                ("before_lease", uuid.UUID("21212121212121212121212121212121"), uuid.UUID("23232323232323232323232323232323"), {"finished": CLAIMED_AT, "created": (CLAIMED_AT + 5, CLAIMED_AT + 5)}),
+                ("split_clock", uuid.UUID("24242424242424242424242424242424"), uuid.UUID("25252525252525252525252525252525"), {"created": (LEASE + 5, LEASE + 6)}),
+                ("partial", uuid.UUID("26262626262626262626262626262626"), uuid.UUID("27272727272727272727272727272727"), {"roles": ("user",)}),
+            )
+            proofs = {}
+            for label, operation_id, conversation_id, changes in cases:
+                plant(operation_id, conversation_id, **changes)
+                proof, _delta = inspect(
+                    repository()[0], OWNER.id, operation_id, RUNNER, CLAIMED_AT,
+                )
+                proofs[label] = proof["type"]
+            print(json.dumps(proofs))
+            """
+        )
+        payload = _payload(self, result)
+        self.assertEqual(
+            set(payload),
+            {
+                "order",
+                "owner",
+                "version",
+                "sequence",
+                "early",
+                "before_lease",
+                "split_clock",
+                "partial",
+            },
+        )
+        for label, proof in payload.items():
+            self.assertEqual(proof, "OutcomeNotProven", label)
 
     def test_running_claim_recovered_unknown_and_acknowledgement(self):
         result = _run(

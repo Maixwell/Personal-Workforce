@@ -251,7 +251,7 @@ def _succeeded(operation, conversation, messages, claimed_at, deadline, lease):
         or conversation.version != operation.expected_version + 1
     ):
         return None
-    pair = _message_pair(operation, messages)
+    pair = _message_pair(operation, messages, lease)
     if pair is None:
         return None
     user_message, _assistant_message = pair
@@ -263,13 +263,10 @@ def _succeeded(operation, conversation, messages, claimed_at, deadline, lease):
     return pair
 
 
-def _message_pair(operation, messages):
+def _message_pair(operation, messages, lease):
     if len(messages) != 2:
         return None
-    if not _created_matches(messages[0], operation) or not _created_matches(
-        messages[1],
-        operation,
-    ):
+    if not _success_timestamps(messages, operation.finished_at_us, lease):
         return None
     user = _message_view(messages[0], operation)
     assistant = _message_view(messages[1], operation)
@@ -313,9 +310,20 @@ def _message_view(row, operation):
     )
 
 
-def _created_matches(row, operation):
-    created_at = row[5]
-    return type(created_at) is int and created_at == operation.finished_at_us
+def _success_timestamps(messages, finished_at, lease):
+    """Prove either one APPLY clock or a later reconciliation clock."""
+    created_at = messages[0][5]
+    if (
+        type(created_at) is not int
+        or type(finished_at) is not int
+        or created_at < 0
+        or created_at > SIGNED_INT64_MAX
+        or messages[1][5] != created_at
+    ):
+        return False
+    if created_at == finished_at:
+        return True
+    return finished_at >= lease and created_at > finished_at
 
 
 def _unknown(operation, messages, runner_id, claimed_at, deadline, lease):

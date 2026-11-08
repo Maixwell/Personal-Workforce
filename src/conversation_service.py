@@ -1,18 +1,36 @@
-"""Orchestrate one turn through a durable claim. Nothing here is persisted."""
+"""Orchestrate one turn through a durable claim and its outcome."""
 
 from dataclasses import dataclass
 from uuid import UUID
 
 from django.db import connection
 
+from max_smart_db.config import EXECUTION_DEADLINE_US, FIXED_LEASE_US
+from max_smart_db.application_validation import SIGNED_INT64_MAX
 from max_smart_db.repository import (
     Adopted,
     AlreadyOwned,
+    AlreadySucceeded,
+    Applied,
     Claimed,
+    ClaimedOperation,
     CommitAmbiguous,
+    DefinitelyFailed,
+    DefiniteProviderCategory,
     DurableClaimConfirmed,
+    DurableFailureObserved,
+    DurableSuccessObserved,
+    DurableUnknownObserved,
+    OperationStatus,
+    OperationView,
+    OutcomeNotProven,
     PrepareCommand,
     Prepared,
+    RecoveredUnknown,
+    Reconciled,
+    RetainedResult,
+    UncertainProviderCategory,
+    UncertainRecorded,
 )
 
 
@@ -32,6 +50,13 @@ class TurnRequest:
 
 
 @dataclass(frozen=True)
+class ProviderFailure:
+    """A completed provider attempt that did not produce usable output."""
+
+    category: DefiniteProviderCategory | UncertainProviderCategory
+
+
+@dataclass(frozen=True)
 class ProviderResponse:
     """One provider response after a proven claim. It is not a durable turn."""
 
@@ -39,6 +64,35 @@ class ProviderResponse:
     runner_id: str
     claimed_at: int
     output_text: str
+
+
+@dataclass(frozen=True)
+class DurableTurnCompleted:
+    """The provider output is committed as one conversation turn."""
+
+    operation_id: UUID
+    claimed_at: int
+    user_message: object
+    assistant_message: object
+
+
+@dataclass(frozen=True)
+class DurableFailureRecorded:
+    """A definite provider failure is durably recorded."""
+
+    operation_id: UUID
+    claimed_at: int
+    failure_category: DefiniteProviderCategory
+
+
+@dataclass(frozen=True)
+class OutcomeUnconfirmed:
+    """The provider attempt is not a durable conversation completion."""
+
+    operation_id: UUID
+    runner_id: str
+    claimed_at: int
+    retained_output: str | None
 
 
 @dataclass(frozen=True)
@@ -68,16 +122,18 @@ class AlreadyDispatched:
 
 
 class ConversationService:
-    """PREPARE or adopt, load context, claim, then call the provider at most once."""
+    """PREPARE or adopt, claim, call the provider once, then persist that outcome."""
 
     def __init__(self, repository, load_context, provider):
         self._repository = repository
         self._load_context = load_context
         self._provider = provider
         self._dispatched = set()
+        self._claims = {}
+        self._retained = {}
 
     def submit(self, request):
-        """Return a repository result, or one non-durable provider response."""
+        """Return a repository result, a durable outcome, or an unconfirmed attempt."""
         if type(request) is not TurnRequest:
             raise TypeError("request_type")
         if (
@@ -110,35 +166,36 @@ class ConversationService:
             return TransactionHeld()
 
         claim = self._repository.claim_running(request.actor_id, operation_id)
-        authorized = self._authorized(request.actor_id, operation_id, claim)
-        if authorized is None:
+        claimed = self._authorize(request, operation_id, claim)
+        if type(claimed) is not ClaimedOperation:
             return claim
-        if authorized in self._dispatched:
+        identity = _identity(claimed)
+        if identity in self._dispatched:
             return AlreadyDispatched(
-                operation_id=authorized[0],
-                runner_id=authorized[1],
-                claimed_at=authorized[2],
+                operation_id=identity[0],
+                runner_id=identity[1],
+                claimed_at=identity[2],
             )
         if not _outside_transaction():
             return TransactionHeld()
-        self._dispatched.add(authorized)
-        output = self._provider(
-            actor_id=request.actor_id,
-            conversation_id=request.conversation_id,
-            operation_id=authorized[0],
-            runner_id=authorized[1],
-            claimed_at=authorized[2],
-            request_content=request.request_content,
-            standing_context=context,
-        )
-        if type(output) is not str:
-            raise TypeError("provider_output_type")
-        return ProviderResponse(
-            operation_id=authorized[0],
-            runner_id=authorized[1],
-            claimed_at=authorized[2],
-            output_text=output,
-        )
+        self._claims[identity] = claimed
+        self._dispatched.add(identity)
+        try:
+            output = self._provider(
+                actor_id=request.actor_id,
+                conversation_id=request.conversation_id,
+                operation_id=identity[0],
+                runner_id=identity[1],
+                claimed_at=identity[2],
+                request_content=request.request_content,
+                standing_context=context,
+            )
+        except Exception:
+            return self._persist(
+                claimed,
+                ("failure", UncertainProviderCategory.PROVIDER_OUTCOME_UNCERTAIN),
+            )
+        return self._persist(claimed, _interpret(output))
 
     def _boundary(self, request):
         if request.adopt_operation_id is None:
@@ -167,21 +224,18 @@ class ConversationService:
             return adopted
         return adopted.reservation.operation_id
 
-    def _authorized(self, actor_id, operation_id, claim):
+    def _authorize(self, request, operation_id, claim):
         if type(claim) is Claimed:
             claimed = claim.claimed_operation
             if (
-                claimed.actor_id != actor_id
+                claimed.actor_id != request.actor_id
                 or claimed.operation_id != operation_id
                 or claimed.runner_id != self._repository.runner_id
+                or claimed.conversation_id != request.conversation_id
                 or type(claimed.claimed_at) is not int
             ):
                 return None
-            return (
-                claimed.operation_id,
-                claimed.runner_id,
-                claimed.claimed_at,
-            )
+            return claimed
         if type(claim) is not CommitAmbiguous:
             return None
         if (
@@ -193,7 +247,7 @@ class ConversationService:
             return None
         try:
             proof = self._repository.confirm_durable_claim(
-                actor_id,
+                request.actor_id,
                 claim.operation_id,
                 claim.runner_id,
                 claim.claimed_at,
@@ -207,7 +261,258 @@ class ConversationService:
             or proof.claimed_at != claim.claimed_at
         ):
             return None
-        return proof.operation_id, proof.runner_id, proof.claimed_at
+        return self._token_from_durable_claim(request, proof)
+
+    def _token_from_durable_claim(self, request, proof):
+        try:
+            viewed = self._repository.get_operation(
+                request.actor_id,
+                proof.operation_id,
+            )
+        except Exception:
+            return None
+        if type(viewed) is not OperationView:
+            return None
+        if (
+            viewed.status is not OperationStatus.RUNNING
+            or viewed.actor_id != request.actor_id
+            or viewed.conversation_id != request.conversation_id
+            or viewed.runner_id != proof.runner_id
+            or viewed.provider_started_at != proof.claimed_at
+            or viewed.fingerprint_version != 1
+            or type(viewed.expected_version) is not int
+            or viewed.expected_version < 0
+            or type(viewed.request_hash) is not str
+            or len(viewed.request_hash) != 64
+        ):
+            return None
+        if proof.claimed_at > SIGNED_INT64_MAX - FIXED_LEASE_US:
+            return None
+        return ClaimedOperation(
+            operation_id=proof.operation_id,
+            actor_id=request.actor_id,
+            conversation_id=viewed.conversation_id,
+            request_hash=viewed.request_hash,
+            fingerprint_version=viewed.fingerprint_version,
+            expected_version=viewed.expected_version,
+            runner_id=proof.runner_id,
+            claimed_at=proof.claimed_at,
+            execution_deadline=proof.claimed_at + EXECUTION_DEADLINE_US,
+            lease_expires_at=proof.claimed_at + FIXED_LEASE_US,
+        )
+
+    def _persist(self, claimed, completion):
+        self._remember(claimed, completion)
+        if not _outside_transaction():
+            return _unconfirmed(claimed, completion)
+        try:
+            result = self._write(claimed, completion)
+        except Exception:
+            return _unconfirmed(claimed, completion)
+        return self._resolve(claimed, completion, result, apply_retries=1)
+
+    def _resolve(self, claimed, completion, result, apply_retries):
+        if type(result) is Applied or type(result) is AlreadySucceeded:
+            return self._success_if_observed(claimed, completion)
+        if type(result) is DefinitelyFailed:
+            return self._failure_if_observed(claimed, completion)
+        if type(result) is UncertainRecorded:
+            return result
+        if type(result) is RecoveredUnknown:
+            return self._unknown_if_observed(claimed, completion)
+        if type(result) is Reconciled:
+            return self._success_if_observed(claimed, completion)
+        if type(result) is CommitAmbiguous:
+            return self._after_ambiguous(
+                claimed,
+                completion,
+                apply_retries,
+                allow_reconcile=True,
+            )
+        return result
+
+    def _after_ambiguous(
+        self,
+        claimed,
+        completion,
+        apply_retries,
+        allow_reconcile,
+    ):
+        proof = self._proof(claimed)
+        if type(proof) is DurableSuccessObserved:
+            self._retained.pop(_identity(claimed), None)
+            return _completed(proof)
+        if type(proof) is DurableFailureObserved:
+            if completion[0] == "success":
+                return _unconfirmed(claimed, completion)
+            self._retained.pop(_identity(claimed), None)
+            return _recorded(proof)
+        if (
+            type(proof) is DurableClaimConfirmed
+            and apply_retries > 0
+            and _same_claim(proof, claimed)
+        ):
+            if not _outside_transaction():
+                return _unconfirmed(claimed, completion)
+            try:
+                result = self._write(claimed, completion)
+            except Exception:
+                return _unconfirmed(claimed, completion)
+            return self._resolve(
+                claimed,
+                completion,
+                result,
+                apply_retries=apply_retries - 1,
+            )
+        if (
+            type(proof) is DurableUnknownObserved
+            and allow_reconcile
+            and completion[0] == "success"
+            and _same_unknown(proof, claimed)
+        ):
+            return self._reconcile(claimed, completion)
+        return _unconfirmed(claimed, completion)
+
+    def _unknown_if_observed(self, claimed, completion):
+        if completion[0] != "success":
+            return _unconfirmed(claimed, completion)
+        proof = self._proof(claimed)
+        if type(proof) is DurableSuccessObserved:
+            self._retained.pop(_identity(claimed), None)
+            return _completed(proof)
+        if type(proof) is not DurableUnknownObserved or not _same_unknown(
+            proof,
+            claimed,
+        ):
+            return _unconfirmed(claimed, completion)
+        return self._reconcile(claimed, completion)
+
+    def _reconcile(self, claimed, completion):
+        if not _outside_transaction():
+            return _unconfirmed(claimed, completion)
+        try:
+            result = self._repository.reconcile_late_success(
+                RetainedResult(
+                    claimed_operation=claimed,
+                    output_text=completion[1],
+                )
+            )
+        except Exception:
+            return _unconfirmed(claimed, completion)
+        if type(result) is Reconciled or type(result) is AlreadySucceeded:
+            return self._success_if_observed(claimed, completion)
+        if type(result) is CommitAmbiguous:
+            return self._after_ambiguous(
+                claimed,
+                completion,
+                apply_retries=0,
+                allow_reconcile=False,
+            )
+        return result
+
+    def _success_if_observed(self, claimed, completion):
+        proof = self._proof(claimed)
+        if type(proof) is DurableSuccessObserved and proof.claimed_at == claimed.claimed_at:
+            self._retained.pop(_identity(claimed), None)
+            return _completed(proof)
+        return _unconfirmed(claimed, completion)
+
+    def _failure_if_observed(self, claimed, completion):
+        proof = self._proof(claimed)
+        if (
+            type(proof) is DurableFailureObserved
+            and proof.claimed_at == claimed.claimed_at
+            and proof.operation_id == claimed.operation_id
+        ):
+            self._retained.pop(_identity(claimed), None)
+            return _recorded(proof)
+        return _unconfirmed(claimed, completion)
+
+    def _proof(self, claimed):
+        if not _outside_transaction():
+            return OutcomeNotProven()
+        try:
+            return self._repository.inspect_durable_outcome(
+                claimed.actor_id,
+                claimed.operation_id,
+                claimed.runner_id,
+                claimed.claimed_at,
+            )
+        except Exception:
+            return OutcomeNotProven()
+
+    def _write(self, claimed, completion):
+        if completion[0] == "success":
+            return self._repository.apply_success(claimed, completion[1])
+        return self._repository.apply_failure(claimed, completion[1])
+
+    def _remember(self, claimed, completion):
+        if completion[0] == "success":
+            self._retained[_identity(claimed)] = completion[1]
+
+
+def _interpret(output):
+    if type(output) is str:
+        if _usable_output(output):
+            return ("success", output)
+        return ("failure", DefiniteProviderCategory.PROVIDER_OUTPUT_INVALID)
+    if type(output) is ProviderFailure and (
+        type(output.category) is DefiniteProviderCategory
+        or type(output.category) is UncertainProviderCategory
+    ):
+        return ("failure", output.category)
+    return ("failure", UncertainProviderCategory.PROVIDER_OUTCOME_UNCERTAIN)
+
+
+def _usable_output(text):
+    try:
+        text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return False
+    return "\x00" not in text and bool(text.strip())
+
+
+def _identity(claimed):
+    return (claimed.operation_id, claimed.runner_id, claimed.claimed_at)
+
+
+def _same_claim(proof, claimed):
+    return (
+        proof.operation_id == claimed.operation_id
+        and proof.runner_id == claimed.runner_id
+        and proof.claimed_at == claimed.claimed_at
+    )
+
+
+def _same_unknown(proof, claimed):
+    return _same_claim(proof, claimed)
+
+
+def _completed(proof):
+    return DurableTurnCompleted(
+        operation_id=proof.operation_id,
+        claimed_at=proof.claimed_at,
+        user_message=proof.user_message,
+        assistant_message=proof.assistant_message,
+    )
+
+
+def _recorded(proof):
+    return DurableFailureRecorded(
+        operation_id=proof.operation_id,
+        claimed_at=proof.claimed_at,
+        failure_category=proof.failure_category,
+    )
+
+
+def _unconfirmed(claimed, completion):
+    retained = completion[1] if completion[0] == "success" else None
+    return OutcomeUnconfirmed(
+        operation_id=claimed.operation_id,
+        runner_id=claimed.runner_id,
+        claimed_at=claimed.claimed_at,
+        retained_output=retained,
+    )
 
 
 def _outside_transaction():
