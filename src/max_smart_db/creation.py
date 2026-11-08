@@ -55,6 +55,12 @@ class SqliteConversationRepository(SqliteConversationReader):
 
         return fail_pre_provider(self, reservation, category)
 
+    def apply_failure(self, claimed, failure):
+        """Record one definite or uncertain provider outcome."""
+        from .provider_failure import apply_failure
+
+        return apply_failure(self, claimed, failure)
+
     def recover_slot(self):
         """Classify or recover the singleton global slot."""
         from .recovery import recover_slot
