@@ -312,6 +312,28 @@ class OutcomeNotProven:
 
 
 @dataclass(frozen=True)
+class PreProviderFailureObserved:
+    """A fresh snapshot proved one committed pre-provider failure."""
+
+    operation_id: UUID
+    failure_category: PreProviderFailureCategory
+
+
+@dataclass(frozen=True)
+class QueuedReservationObserved:
+    """A fresh snapshot proved the original QUEUED reservation is unchanged."""
+
+    operation_id: UUID
+    runner_id: str
+    reservation_expires_at: int
+
+
+@dataclass(frozen=True)
+class PreProviderStateNotProven:
+    """The snapshot did not prove a pre-provider failure or its reservation."""
+
+
+@dataclass(frozen=True)
 class Failed:
     operation: OperationView
 
@@ -486,6 +508,11 @@ InspectDurableOutcomeResult = Union[
     DurableFailureObserved,
     OutcomeNotProven,
 ]
+InspectPreProviderFailureResult = Union[
+    PreProviderFailureObserved,
+    QueuedReservationObserved,
+    PreProviderStateNotProven,
+]
 PreProviderFailureResult = Union[
     Failed,
     AlreadyFailed,
@@ -632,6 +659,14 @@ class ConversationRepository(Protocol):
         claimed_at: int,
     ) -> InspectDurableOutcomeResult:
         """Classify one committed outcome from a fresh read snapshot."""
+
+    def inspect_pre_provider_failure(
+        self,
+        actor_id: int,
+        operation_id: UUID,
+        runner_id: str,
+    ) -> InspectPreProviderFailureResult:
+        """Classify one pre-provider reservation from a fresh read snapshot."""
 
     def fail_pre_provider(
         self,

@@ -89,6 +89,16 @@ class SqliteConversationReader:
             claimed_at,
         )
 
+    def inspect_pre_provider_failure(self, actor_id, operation_id, runner_id):
+        """Classify one pre-provider reservation without writing."""
+        from .pre_provider_inspection import inspect_pre_provider_failure
+
+        return inspect_pre_provider_failure(
+            actor_id,
+            operation_id,
+            runner_id,
+        )
+
     def load_snapshot(self, actor_id, conversation_id):
         """Return one owned snapshot from a single deferred read."""
         _require_actor(actor_id)
