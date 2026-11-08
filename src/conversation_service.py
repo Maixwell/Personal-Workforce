@@ -21,6 +21,7 @@ from max_smart_db.repository import (
     DurableFailureObserved,
     DurableSuccessObserved,
     DurableUnknownObserved,
+    NotFound,
     OperationStatus,
     AlreadyFailed,
     Failed,
@@ -132,6 +133,53 @@ class PreProviderFailureUnconfirmed:
 
 
 @dataclass(frozen=True)
+class RestartQueued:
+    """A persisted QUEUED reservation. It does not authorize execution."""
+
+    operation: OperationView
+
+
+@dataclass(frozen=True)
+class RestartRunning:
+    """A persisted RUNNING claim. It may already have reached the provider."""
+
+    operation: OperationView
+
+
+@dataclass(frozen=True)
+class RestartUnknownBlocking:
+    """An unacknowledged OUTCOME_UNKNOWN operation still blocks the conversation."""
+
+    operation: OperationView
+
+
+@dataclass(frozen=True)
+class RestartUnknownAcknowledged:
+    """An acknowledged OUTCOME_UNKNOWN operation is historical."""
+
+    operation: OperationView
+
+
+@dataclass(frozen=True)
+class RestartCompleted:
+    """A persisted SUCCEEDED, FAILED, or CANCELLED operation."""
+
+    operation: OperationView
+
+
+@dataclass(frozen=True)
+class RestartUnproven:
+    """The public operation row does not match an accepted restart class."""
+
+
+@dataclass(frozen=True)
+class RecoveryUnconfirmed:
+    """Explicit recovery did not prove whether its commit finished."""
+
+    operation_id: UUID | None = None
+
+
+@dataclass(frozen=True)
 class TransactionHeld:
     """A caller transaction was open, so context and the provider were skipped."""
 
@@ -236,6 +284,32 @@ class ConversationService:
                 ("failure", UncertainProviderCategory.PROVIDER_OUTCOME_UNCERTAIN),
             )
         return self._persist(claimed, _interpret(output))
+
+    def classify_restart(self, actor_id, operation_id):
+        """Classify one persisted operation without writing or calling the provider."""
+        _require_restart_identity(actor_id, operation_id)
+        if not _outside_transaction():
+            return TransactionHeld()
+        viewed = self._repository.get_operation(actor_id, operation_id)
+        if type(viewed) is NotFound:
+            return viewed
+        return _restart_class(viewed, actor_id, operation_id)
+
+    def adopt_persisted(self, actor_id, operation_id):
+        """Adopt one persisted reservation. A claim still has to authorize execution."""
+        _require_restart_identity(actor_id, operation_id)
+        if not _outside_transaction():
+            return TransactionHeld()
+        return self._repository.adopt_queued(actor_id, operation_id)
+
+    def recover(self):
+        """Recover the singleton slot once. This does not call the provider."""
+        if not _outside_transaction():
+            return TransactionHeld()
+        result = self._repository.recover_slot()
+        if type(result) is CommitAmbiguous:
+            return RecoveryUnconfirmed(operation_id=result.operation_id)
+        return result
 
     def _boundary(self, request):
         if request.adopt_operation_id is None:
@@ -624,4 +698,81 @@ def _confirmed_pre_provider(view, reservation, category):
         and view.acknowledged is False
         and observed is not None
         and observed.value == category.value
+    )
+
+
+def _require_restart_identity(actor_id, operation_id):
+    if type(actor_id) is not int:
+        raise TypeError("actor_id_type")
+    if type(operation_id) is not UUID:
+        raise TypeError("operation_id_type")
+
+
+def _restart_class(view, actor_id, operation_id):
+    if (
+        type(view) is not OperationView
+        or view.actor_id != actor_id
+        or view.operation_id != operation_id
+    ):
+        return RestartUnproven()
+    status = view.status
+    if status is OperationStatus.QUEUED and _queued_observation(view):
+        return RestartQueued(view)
+    if status is OperationStatus.RUNNING and _running_observation(view):
+        return RestartRunning(view)
+    if status is OperationStatus.OUTCOME_UNKNOWN and _blocking_unknown(view):
+        return RestartUnknownBlocking(view)
+    if (
+        status is OperationStatus.OUTCOME_UNKNOWN
+        and _acknowledged_unknown(view)
+    ):
+        return RestartUnknownAcknowledged(view)
+    if status in (
+        OperationStatus.SUCCEEDED,
+        OperationStatus.FAILED,
+        OperationStatus.CANCELLED,
+    ) and _completed_observation(view):
+        return RestartCompleted(view)
+    return RestartUnproven()
+
+
+def _queued_observation(view):
+    return (
+        view.blocks_conversation is True
+        and view.acknowledged is False
+        and view.provider_started_at is None
+        and type(view.runner_id) is str
+        and view.runner_id != ""
+    )
+
+
+def _running_observation(view):
+    return (
+        view.blocks_conversation is True
+        and view.acknowledged is False
+        and type(view.provider_started_at) is int
+        and type(view.runner_id) is str
+        and view.runner_id != ""
+    )
+
+
+def _blocking_unknown(view):
+    return (
+        view.blocks_conversation is True
+        and view.acknowledged is False
+        and type(view.provider_started_at) is int
+        and type(view.runner_id) is str
+        and view.runner_id != ""
+    )
+
+
+def _acknowledged_unknown(view):
+    return view.acknowledged is True and view.blocks_conversation is False
+
+
+def _completed_observation(view):
+    return (
+        view.blocks_conversation is False
+        and view.acknowledged is False
+        and view.runner_id is None
     )

@@ -957,7 +957,6 @@ class ConversationServiceTests(unittest.TestCase):
         source = (SRC_ROOT / "conversation_service.py").read_text()
         for banned in (
             "GlobalModelSlot",
-            "recover_slot",
             "terminal",
             "session",
             "model_client",
