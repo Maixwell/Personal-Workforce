@@ -7,6 +7,11 @@ from django.db import connection
 
 from max_smart_db.config import EXECUTION_DEADLINE_US, FIXED_LEASE_US
 from max_smart_db.application_validation import SIGNED_INT64_MAX
+from max_smart_db.fingerprint import (
+    FINGERPRINT_VERSION,
+    FingerprintValidationError,
+    fingerprint_v1,
+)
 from max_smart_db.repository import (
     Adopted,
     AlreadyOwned,
@@ -15,6 +20,7 @@ from max_smart_db.repository import (
     Claimed,
     ClaimedOperation,
     CommitAmbiguous,
+    ConversationView,
     DefinitelyFailed,
     DefiniteProviderCategory,
     DurableClaimConfirmed,
@@ -186,6 +192,11 @@ class RecoveryUnconfirmed:
 @dataclass(frozen=True)
 class TransactionHeld:
     """A caller transaction was open, so context and the provider were skipped."""
+
+
+@dataclass(frozen=True)
+class ExecutionIdentityMismatch:
+    """The caller input does not match the persisted execution request."""
 
 
 @dataclass(frozen=True)
@@ -417,15 +428,35 @@ class ConversationService:
                 return prepared
             return prepared.reservation
 
+        proved = self._prove_adopted_execution(request)
+        if type(proved) is not OperationView:
+            return proved
         adopted = self._repository.adopt_queued(
             request.actor_id,
             request.adopt_operation_id,
         )
         if type(adopted) is not Adopted and type(adopted) is not AlreadyOwned:
             return adopted
-        if adopted.reservation.runner_id != request.runner_id:
-            return adopted
+        if not _reservation_matches(request, proved, adopted.reservation):
+            return ExecutionIdentityMismatch()
         return adopted.reservation
+
+    def _prove_adopted_execution(self, request):
+        viewed = self._repository.get_operation(
+            request.actor_id,
+            request.adopt_operation_id,
+        )
+        if type(viewed) is NotFound:
+            return viewed
+        if not _operation_identity_matches(request, viewed):
+            return ExecutionIdentityMismatch()
+        conversation = self._repository.get_conversation(
+            request.actor_id,
+            viewed.conversation_id,
+        )
+        if not _execution_fingerprint_matches(request, viewed, conversation):
+            return ExecutionIdentityMismatch()
+        return viewed
 
     def _reject_before_provider(self, reservation, category):
         if type(category) is not PreProviderFailureCategory:
@@ -787,6 +818,55 @@ def _confirmed_pre_provider(view, reservation, category):
         and view.acknowledged is False
         and observed is not None
         and observed.value == category.value
+    )
+
+
+def _operation_identity_matches(request, viewed):
+    return (
+        type(viewed) is OperationView
+        and viewed.actor_id == request.actor_id
+        and viewed.operation_id == request.adopt_operation_id
+        and viewed.conversation_id == request.conversation_id
+        and viewed.expected_version == request.expected_version
+        and viewed.fingerprint_version == FINGERPRINT_VERSION
+    )
+
+
+def _execution_fingerprint_matches(request, viewed, conversation):
+    if (
+        type(conversation) is not ConversationView
+        or conversation.actor_id != request.actor_id
+        or conversation.conversation_id != viewed.conversation_id
+        or type(conversation.role_slug) is not str
+        or type(viewed.request_hash) is not str
+    ):
+        return False
+    try:
+        digest = fingerprint_v1(
+            request.actor_id,
+            request.conversation_id.hex,
+            "message",
+            request.expected_version,
+            conversation.role_slug,
+            request.provider_id,
+            request.model_id,
+            request.request_content,
+        )
+    except FingerprintValidationError:
+        return False
+    return digest == viewed.request_hash
+
+
+def _reservation_matches(request, viewed, reservation):
+    return (
+        type(reservation) is QueuedReservation
+        and reservation.operation_id == viewed.operation_id
+        and reservation.actor_id == request.actor_id
+        and reservation.conversation_id == request.conversation_id
+        and reservation.expected_version == request.expected_version
+        and reservation.fingerprint_version == FINGERPRINT_VERSION
+        and reservation.request_hash == viewed.request_hash
+        and reservation.runner_id == request.runner_id
     )
 
 

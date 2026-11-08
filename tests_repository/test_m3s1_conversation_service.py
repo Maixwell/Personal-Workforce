@@ -42,9 +42,11 @@ from conversation_service import (
     TurnRequest,
 )
 from max_smart_db.creation import SqliteConversationRepository
+from max_smart_db.fingerprint import fingerprint_v1
 from max_smart_db.models import Conversation, GlobalModelSlot, Message, Operation
 from max_smart_db.repository import (
     Claimed,
+    ConversationView,
     ClaimedOperation,
     ClaimNotConfirmed,
     CommitAmbiguous,
@@ -78,7 +80,16 @@ OPERATION = uuid.UUID("11111111111111111111111111111111")
 MISSING = uuid.UUID("33333333333333333333333333333333")
 RUNNER = "AAAAAAAAAAAAAAAAAAAAAA"
 FORMER = "BBBBBBBBBBBBBBBBBBBBBQ"
-HASH = "ab" * 32
+HASH = fingerprint_v1(
+    OWNER.id,
+    CONVERSATION.hex,
+    "message",
+    0,
+    "max-smart",
+    "openai",
+    "gpt-5.6-sol",
+    "hello",
+)
 CONTEXT = "standing-context:" + ("x" * 3000)
 
 Conversation.objects.create(
@@ -797,6 +808,19 @@ class ConversationServiceTests(unittest.TestCase):
                 def prepare(self, command):
                     self.prepare_calls += 1
                     return self.prepared
+
+                def get_operation(self, actor_id, operation_id):
+                    return view
+
+                def get_conversation(self, actor_id, conversation_id):
+                    return ConversationView(
+                        conversation_id=CONVERSATION,
+                        actor_id=OWNER.id,
+                        role_slug="max-smart",
+                        version=0,
+                        next_sequence=1,
+                        title=None,
+                    )
 
                 def adopt_queued(self, actor_id, operation_id):
                     return self.prepared
