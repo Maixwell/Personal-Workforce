@@ -37,6 +37,12 @@ class SqliteConversationRepository(SqliteConversationReader):
 
         return prepare(self, command)
 
+    def adopt_queued(self, actor_id, operation_id):
+        """Transfer or expire one actor-owned QUEUED reservation."""
+        from .adoption import adopt_queued
+
+        return adopt_queued(self, actor_id, operation_id)
+
     def recover_slot(self):
         """Classify or recover the singleton global slot."""
         from .recovery import recover_slot
