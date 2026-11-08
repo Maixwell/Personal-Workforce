@@ -31,6 +31,12 @@ class CreationInputError(ValueError):
 class SqliteConversationRepository(SqliteConversationReader):
     """Owner-scoped reads plus conversation creation."""
 
+    def recover_slot(self):
+        """Classify or recover the singleton global slot."""
+        from .recovery import recover_slot
+
+        return recover_slot(self.clock)
+
     def create_conversation(self, actor_id, role_slug, title):
         """Insert one conversation and return its durable view."""
         require_explicit_positive_integer_id(actor_id)
