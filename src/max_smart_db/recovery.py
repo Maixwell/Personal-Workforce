@@ -45,29 +45,22 @@ class _Attempt:
 def recover_slot(clock):
     """Classify or recover an expired singleton slot in one writer transaction."""
     body_complete = False
-    attempt = _Attempt()
+    attempt = None
     now = None
     try:
         with transaction.atomic(durable=True):
             now = _read_clock_once(clock)
-            classified = _inspect_slot(now)
-            if isinstance(classified, _RecoverQueued):
-                attempt.operation_id = classified.operation.id
-                _recover_queued(classified, now, attempt)
-                result = CancelledExpiredQueued()
-            elif isinstance(classified, _RecoverRunning):
-                attempt.operation_id = classified.operation.id
-                _recover_running(classified, now, attempt)
-                result = MarkedOutcomeUnknown()
-            else:
-                result = classified
+            result, attempt = recover_slot_locked(now)
             body_complete = True
     except _ConditionalRace:
         return _classify_after_race(now)
     except OperationalError as error:
         if body_complete:
             return CommitAmbiguous(operation_id=attempt.operation_id)
-        if not attempt.mutation_started and _is_lock_failure(error):
+        if (
+            (attempt is None or not attempt.mutation_started)
+            and _is_lock_failure(error)
+        ):
             return DatabaseBusy()
         raise RepositoryIntegrityError() from None
     except IntegrityError:
@@ -79,6 +72,21 @@ def recover_slot(clock):
             return CommitAmbiguous(operation_id=attempt.operation_id)
         raise
     return result
+
+
+def recover_slot_locked(now):
+    """Recover an eligible slot inside the caller's writer transaction."""
+    attempt = _Attempt()
+    classified = _inspect_slot(now)
+    if isinstance(classified, _RecoverQueued):
+        attempt.operation_id = classified.operation.id
+        _recover_queued(classified, now, attempt)
+        return CancelledExpiredQueued(), attempt
+    if isinstance(classified, _RecoverRunning):
+        attempt.operation_id = classified.operation.id
+        _recover_running(classified, now, attempt)
+        return MarkedOutcomeUnknown(), attempt
+    return classified, attempt
 
 
 def _inspect_slot(now):

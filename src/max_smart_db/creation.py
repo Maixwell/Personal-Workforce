@@ -31,6 +31,12 @@ class CreationInputError(ValueError):
 class SqliteConversationRepository(SqliteConversationReader):
     """Owner-scoped reads plus conversation creation."""
 
+    def prepare(self, command):
+        """Prepare one QUEUED operation without crossing the provider boundary."""
+        from .prepare import prepare
+
+        return prepare(self, command)
+
     def recover_slot(self):
         """Classify or recover the singleton global slot."""
         from .recovery import recover_slot
