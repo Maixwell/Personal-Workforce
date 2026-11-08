@@ -67,6 +67,12 @@ class SqliteConversationRepository(SqliteConversationReader):
 
         return apply_success(self, claimed, output_text)
 
+    def reconcile_late_success(self, retained_result):
+        """Reconcile one retained success after recovery."""
+        from .late_success import reconcile_late_success
+
+        return reconcile_late_success(self, retained_result)
+
     def recover_slot(self):
         """Classify or recover the singleton global slot."""
         from .recovery import recover_slot
