@@ -170,6 +170,7 @@ def state(identifier):
         "slot_reservation": slot.reservation_expires_at_us,
         "slot_lease": slot.lease_expires_at_us,
         "messages": Message.objects.count(),
+        "version": Conversation.objects.get(pk=operation.conversation_id).version,
     }
 
 
@@ -250,6 +251,11 @@ def public(outcome, box):
         "reservation_during_context": box.reservation_during_context,
         "runner_during_context": box.runner_during_context,
         "output": getattr(outcome, "output_text", None),
+        "assistant": getattr(
+            getattr(outcome, "assistant_message", None),
+            "content",
+            None,
+        ),
         "messages": Message.objects.count(),
     }
 """
@@ -307,26 +313,27 @@ class ConversationServiceTests(unittest.TestCase):
             """
         )
         payload = _payload(self, result)
-        self.assertEqual(payload["type"], "ProviderResponse")
-        self.assertEqual(payload["output"], "model-output")
+        self.assertEqual(payload["type"], "DurableTurnCompleted")
+        self.assertEqual(payload["assistant"], "model-output")
         self.assertEqual(payload["provider"], 1)
         self.assertEqual(payload["context"], 1)
         self.assertEqual(payload["claims"], 1)
         self.assertEqual(payload["confirms"], 0)
-        self.assertEqual(payload["clock"], 2)
+        self.assertEqual(payload["clock"], 3)
         self.assertFalse(payload["context_atomic"])
         self.assertFalse(payload["provider_atomic"])
         self.assertTrue(payload["context_autocommit"])
         self.assertTrue(payload["provider_autocommit"])
         self.assertTrue(payload["context_exact"])
         self.assertEqual(payload["claimed_at"], 123_456)
-        self.assertEqual(payload["messages"], 0)
-        self.assertEqual(payload["state"]["status"], "RUNNING")
+        self.assertEqual(payload["messages"], 2)
+        self.assertEqual(payload["state"]["status"], "SUCCEEDED")
         self.assertEqual(payload["state"]["started"], 123_456)
         self.assertEqual(payload["state"]["deadline"], 600_123_456)
         self.assertEqual(payload["state"]["lease"], 720_123_456)
+        self.assertEqual(payload["state"]["version"], 1)
         self.assertIsNone(payload["state"]["slot_reservation"])
-        self.assertEqual(payload["state"]["slot_lease"], 720_123_456)
+        self.assertIsNone(payload["state"]["slot_lease"])
 
     def test_valid_queued_adoption_invokes_provider_once(self):
         result = _run(
@@ -347,7 +354,7 @@ class ConversationServiceTests(unittest.TestCase):
             """
         )
         payload = _payload(self, result)
-        self.assertEqual(payload["type"], "ProviderResponse")
+        self.assertEqual(payload["type"], "DurableTurnCompleted")
         self.assertEqual(payload["provider"], 1)
         self.assertEqual(payload["claims"], 1)
         self.assertEqual(payload["confirms"], 0)
@@ -359,7 +366,7 @@ class ConversationServiceTests(unittest.TestCase):
         self.assertEqual(payload["state"]["started"], 123_456)
         self.assertEqual(payload["state"]["deadline"], 600_123_456)
         self.assertEqual(payload["state"]["lease"], 720_123_456)
-        self.assertEqual(payload["messages"], 0)
+        self.assertEqual(payload["messages"], 2)
 
     def test_commit_succeeded_ambiguity_confirms_then_invokes_once(self):
         result = _run(
@@ -390,15 +397,15 @@ class ConversationServiceTests(unittest.TestCase):
             """
         )
         payload = _payload(self, result)
-        self.assertEqual(payload["type"], "ProviderResponse")
+        self.assertEqual(payload["type"], "DurableTurnCompleted")
         self.assertEqual(payload["provider"], 1)
         self.assertEqual(payload["claims"], 1)
         self.assertEqual(payload["confirms"], 1)
         self.assertEqual(payload["claimed_at"], 123_456)
         self.assertGreaterEqual(payload["commits"], 2)
-        self.assertEqual(payload["state"]["status"], "RUNNING")
+        self.assertEqual(payload["state"]["status"], "SUCCEEDED")
         self.assertEqual(payload["state"]["started"], 123_456)
-        self.assertEqual(payload["messages"], 0)
+        self.assertEqual(payload["messages"], 2)
 
     def test_failed_ambiguous_claims_do_not_invoke_provider(self):
         rolled = _payload(self, _run(
@@ -700,7 +707,7 @@ class ConversationServiceTests(unittest.TestCase):
             """
         )
         payload = _payload(self, result)
-        self.assertEqual(payload["type"], "ProviderResponse")
+        self.assertEqual(payload["type"], "DurableTurnCompleted")
         self.assertEqual(payload["provider"], 1)
         self.assertEqual(payload["again"], "Existing")
         self.assertEqual(payload["claims"], 1)
@@ -727,14 +734,14 @@ class ConversationServiceTests(unittest.TestCase):
             """
         )
         payload = _payload(self, result)
-        self.assertEqual(payload["first"]["type"], "ProviderResponse")
+        self.assertEqual(payload["first"]["type"], "DurableTurnCompleted")
         self.assertEqual(payload["first"]["provider"], 1)
         self.assertEqual(payload["replay_type"], "Existing")
         self.assertEqual(payload["replay_provider"], 0)
         self.assertEqual(payload["replay_claims"], 0)
         self.assertEqual(payload["replay_confirms"], 0)
-        self.assertEqual(payload["state"]["status"], "RUNNING")
-        self.assertEqual(payload["state"]["messages"], 0)
+        self.assertEqual(payload["state"]["status"], "SUCCEEDED")
+        self.assertEqual(payload["state"]["messages"], 2)
 
     def test_authorization_matrix_fails_closed(self):
         result = _run(
@@ -950,8 +957,6 @@ class ConversationServiceTests(unittest.TestCase):
         source = (SRC_ROOT / "conversation_service.py").read_text()
         for banned in (
             "GlobalModelSlot",
-            "apply_success",
-            "apply_failure",
             "recover_slot",
             "terminal",
             "session",
