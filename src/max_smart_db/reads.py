@@ -55,6 +55,23 @@ class SqliteConversationReader:
             return NotFound()
         return _operation_view(row)
 
+    def confirm_durable_claim(
+        self,
+        actor_id,
+        operation_id,
+        runner_id,
+        claimed_at,
+    ):
+        """Prove one committed RUNNING claim without writing."""
+        from .claim_confirmation import confirm_durable_claim
+
+        return confirm_durable_claim(
+            actor_id,
+            operation_id,
+            runner_id,
+            claimed_at,
+        )
+
     def load_snapshot(self, actor_id, conversation_id):
         """Return one owned snapshot from a single deferred read."""
         _require_actor(actor_id)

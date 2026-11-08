@@ -265,6 +265,20 @@ class Claimed:
 
 
 @dataclass(frozen=True)
+class DurableClaimConfirmed:
+    """A fresh snapshot proved this exact durable RUNNING claim."""
+
+    operation_id: UUID
+    runner_id: str
+    claimed_at: int
+
+
+@dataclass(frozen=True)
+class ClaimNotConfirmed:
+    """The snapshot did not prove a durable claim."""
+
+
+@dataclass(frozen=True)
 class Failed:
     operation: OperationView
 
@@ -431,6 +445,7 @@ ClaimResult = Union[
     DatabaseBusy,
     CommitAmbiguous,
 ]
+ConfirmDurableClaimResult = Union[DurableClaimConfirmed, ClaimNotConfirmed]
 PreProviderFailureResult = Union[
     Failed,
     AlreadyFailed,
@@ -559,6 +574,15 @@ class ConversationRepository(Protocol):
         operation_id: UUID,
     ) -> ClaimResult:
         """Claim one queued operation. Not implemented in R1."""
+
+    def confirm_durable_claim(
+        self,
+        actor_id: int,
+        operation_id: UUID,
+        runner_id: str,
+        claimed_at: int,
+    ) -> ConfirmDurableClaimResult:
+        """Prove one committed RUNNING claim from a fresh read snapshot."""
 
     def fail_pre_provider(
         self,
