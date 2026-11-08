@@ -18,6 +18,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -132,6 +133,219 @@ def operation_state(operation_id):
         "next_sequence": conversation.next_sequence,
         "messages": messages,
     }
+
+
+def _uuid_text(value):
+    if value is None:
+        return None
+    text = value.hex() if isinstance(value, bytes) else str(value)
+    text = text.replace("-", "")
+    return (
+        f"{text[0:8]}-{text[8:12]}-{text[12:16]}-"
+        f"{text[16:20]}-{text[20:32]}"
+    )
+
+
+def fresh_snapshot(operation_id):
+    connection.close()
+    fresh = sqlite3.connect(f"{database.as_uri()}?mode=rw", uri=True)
+    try:
+        operation = fresh.execute(
+            "SELECT status, blocks_conversation, runner_id, "
+            "provider_started_at_us, execution_deadline_us, "
+            "lease_expires_at_us, finished_at_us, failure_category, "
+            "acknowledged_at_us, conversation_id "
+            "FROM operation WHERE id = ?",
+            (operation_id.hex,),
+        ).fetchone()
+        conversation = fresh.execute(
+            "SELECT version, next_sequence FROM conversation WHERE id = ?",
+            (operation[9],),
+        ).fetchone()
+        messages = fresh.execute(
+            "SELECT sequence, role, content FROM message "
+            "WHERE operation_id = ? ORDER BY sequence",
+            (operation_id.hex,),
+        ).fetchall()
+        slot_row = fresh.execute(
+            "SELECT operation_id, runner_id, reservation_expires_at_us, "
+            "lease_expires_at_us FROM global_model_slot WHERE id = 1"
+        ).fetchone()
+        key_count = fresh.execute(
+            "SELECT COUNT(*) FROM idempotency_key WHERE operation_id = ?",
+            (operation_id.hex,),
+        ).fetchone()[0]
+        operation_count = fresh.execute(
+            "SELECT COUNT(*) FROM operation"
+        ).fetchone()[0]
+    finally:
+        fresh.close()
+    return {
+        "status": operation[0],
+        "blocks": operation[1],
+        "runner": operation[2],
+        "started": operation[3],
+        "deadline": operation[4],
+        "lease": operation[5],
+        "finished": operation[6],
+        "category": operation[7],
+        "acknowledged": operation[8],
+        "version": conversation[0],
+        "next_sequence": conversation[1],
+        "messages": [list(row) for row in messages],
+        "slot_operation": _uuid_text(slot_row[0]),
+        "slot_runner": slot_row[1],
+        "slot_reservation": slot_row[2],
+        "slot_lease": slot_row[3],
+        "key_count": key_count,
+        "operation_count": operation_count,
+    }
+
+
+def post_commit_failure():
+    real_commit = connection.commit
+    state = {"committed": False}
+
+    def commit_then_fail(*args, **kwargs):
+        real_commit(*args, **kwargs)
+        state["committed"] = True
+        raise OperationalError("simulated post-commit transport failure")
+
+    connection.commit = commit_then_fail
+    return real_commit, state
+
+
+def ordered_pair(first, second):
+    from django.db import close_old_connections
+
+    done = threading.Event()
+    bucket = {"first": None, "second": None, "errors": []}
+
+    def run_first():
+        close_old_connections()
+        try:
+            bucket["first"] = first()
+        except Exception as error:
+            bucket["errors"].append("first:" + type(error).__name__)
+        finally:
+            done.set()
+            close_old_connections()
+
+    def run_second():
+        close_old_connections()
+        if not done.wait(30):
+            bucket["errors"].append("second:timeout")
+            return
+        try:
+            bucket["second"] = second()
+        except Exception as error:
+            bucket["errors"].append("second:" + type(error).__name__)
+        finally:
+            close_old_connections()
+
+    threads = [
+        threading.Thread(target=run_first),
+        threading.Thread(target=run_second),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return bucket
+
+
+def overlapping_writers(winner_call, loser_call):
+    from django.db import close_old_connections
+
+    winner_holds = threading.Event()
+    loser_entered = threading.Event()
+    roles = {}
+    evidence = {}
+    results = {"winner": None, "loser": None, "errors": []}
+
+    def gate(execute, sql, params, many, context):
+        role = roles.get(threading.get_ident())
+        text = " ".join(sql.split()).upper() if isinstance(sql, str) else ""
+        if text.startswith("BEGIN") and role == "winner":
+            result = execute(sql, params, many, context)
+            evidence["winner_begin_sql"] = text
+            evidence["winner_begin_returned"] = time.monotonic_ns()
+            winner_holds.set()
+            return result
+        if text.startswith("BEGIN") and role == "loser":
+            evidence["loser_begin_sql"] = text
+            evidence["loser_begin_entered"] = time.monotonic_ns()
+            loser_entered.set()
+            result = execute(sql, params, many, context)
+            evidence["loser_begin_returned"] = time.monotonic_ns()
+            return result
+        if (
+            role == "winner"
+            and winner_holds.is_set()
+            and not evidence.get("winner_waited")
+        ):
+            evidence["winner_waited"] = True
+            if not loser_entered.wait(30):
+                raise TimeoutError("loser did not enter BEGIN")
+        return execute(sql, params, many, context)
+
+    def run_winner():
+        close_old_connections()
+        roles[threading.get_ident()] = "winner"
+        try:
+            connection.ensure_connection()
+            real_commit = connection.commit
+
+            def commit_and_record(*args, **kwargs):
+                evidence["winner_commit_entered"] = time.monotonic_ns()
+                try:
+                    return real_commit(*args, **kwargs)
+                finally:
+                    evidence["winner_commit_returned"] = time.monotonic_ns()
+
+            connection.commit = commit_and_record
+            with connection.execute_wrapper(gate):
+                results["winner"] = winner_call()
+        except Exception as error:
+            results["errors"].append(
+                "winner:" + type(error).__name__ + ": " + str(error)
+            )
+            winner_holds.set()
+        finally:
+            close_old_connections()
+
+    def run_loser():
+        close_old_connections()
+        roles[threading.get_ident()] = "loser"
+        if not winner_holds.wait(30):
+            results["errors"].append("loser:winner-lock-timeout")
+            return
+        try:
+            connection.ensure_connection()
+            with connection.execute_wrapper(gate):
+                results["loser"] = loser_call()
+        except Exception as error:
+            results["errors"].append(
+                "loser:" + type(error).__name__ + ": " + str(error)
+            )
+            loser_entered.set()
+        finally:
+            close_old_connections()
+
+    loser_thread = threading.Thread(target=run_loser)
+    winner_thread = threading.Thread(target=run_winner)
+    loser_thread.start()
+    winner_thread.start()
+    winner_thread.join()
+    loser_thread.join()
+    results["overlap"] = evidence
+    return results
+
+
+def startup_scans():
+    connection.close()
+    verification = verify_ordinary_startup(connection, scan_migration_package())
+    return list(verification.scans)
 """
 
 
@@ -925,6 +1139,623 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(payload["outcomes"], ["ModelBusy", "Prepared"])
         self.assertEqual(payload["failures"], [])
         self.assertEqual(payload["live_operations"], 1)
+
+    def test_commit_succeeds_before_reported_ambiguity(self):
+        result = _run(
+            """\
+            from max_smart_db.repository import ClaimedOperation
+
+            clock = Clock(100_000)
+            repo = repository(clock)
+            conversation_id = open_conversation(repo)
+            real_commit, state = post_commit_failure()
+            try:
+                prepared = repo.prepare(command(
+                    OWNER.id,
+                    conversation_id,
+                    "prepare despite reported failure",
+                    key_for(21),
+                ))
+            finally:
+                connection.commit = real_commit
+            prepare_committed = state["committed"]
+            prepare_fresh = fresh_snapshot(prepared.operation_id)
+            prepare_scans = startup_scans()
+            repeated = repo.prepare(command(
+                OWNER.id,
+                conversation_id,
+                "prepare despite reported failure",
+                key_for(21),
+            ))
+            after_repeat = fresh_snapshot(prepared.operation_id)
+            real_commit, state = post_commit_failure()
+            try:
+                claimed = repo.claim_running(OWNER.id, prepared.operation_id)
+            finally:
+                connection.commit = real_commit
+            claim_committed = state["committed"]
+            claim_fresh = fresh_snapshot(prepared.operation_id)
+            claim_scans = startup_scans()
+            provider_calls = 0 if type(claimed).__name__ == "CommitAmbiguous" else 1
+            repeated_claim = repo.claim_running(OWNER.id, prepared.operation_id)
+            real_commit, state = post_commit_failure()
+            try:
+                applied = repo.apply_success(
+                    ClaimedOperation(
+                        operation_id=prepared.operation_id,
+                        actor_id=OWNER.id,
+                        conversation_id=conversation_id,
+                        request_hash=repeated.operation.request_hash,
+                        fingerprint_version=repeated.operation.fingerprint_version,
+                        expected_version=repeated.operation.expected_version,
+                        runner_id=RUNNER,
+                        claimed_at=claim_fresh["started"],
+                        execution_deadline=claim_fresh["deadline"],
+                        lease_expires_at=claim_fresh["lease"],
+                    ),
+                    "durable assistant",
+                )
+            finally:
+                connection.commit = real_commit
+            apply_committed = state["committed"]
+            apply_fresh = fresh_snapshot(prepared.operation_id)
+            apply_scans = startup_scans()
+            duplicate = repo.apply_success(
+                ClaimedOperation(
+                    operation_id=prepared.operation_id,
+                    actor_id=OWNER.id,
+                    conversation_id=conversation_id,
+                    request_hash=repeated.operation.request_hash,
+                    fingerprint_version=repeated.operation.fingerprint_version,
+                    expected_version=repeated.operation.expected_version,
+                    runner_id=RUNNER,
+                    claimed_at=claim_fresh["started"],
+                    execution_deadline=claim_fresh["deadline"],
+                    lease_expires_at=claim_fresh["lease"],
+                ),
+                "must not replace",
+            )
+            duplicate_fresh = fresh_snapshot(prepared.operation_id)
+            print(json.dumps({
+                "prepare_type": type(prepared).__name__,
+                "prepare_committed": prepare_committed,
+                "prepare_operation": str(prepared.operation_id),
+                "prepare_runner": prepared.runner_id,
+                "prepare_fresh": prepare_fresh,
+                "prepare_scans": prepare_scans,
+                "repeated": type(repeated).__name__,
+                "repeated_operation": str(repeated.operation.operation_id),
+                "after_repeat": after_repeat,
+                "claim_type": type(claimed).__name__,
+                "claim_committed": claim_committed,
+                "claim_operation": str(claimed.operation_id),
+                "claim_runner": claimed.runner_id,
+                "claim_at": claimed.claimed_at,
+                "provider_calls": provider_calls,
+                "claim_fresh": claim_fresh,
+                "claim_scans": claim_scans,
+                "repeated_claim": type(repeated_claim).__name__,
+                "apply_type": type(applied).__name__,
+                "apply_committed": apply_committed,
+                "apply_operation": str(applied.operation_id),
+                "apply_fresh": apply_fresh,
+                "apply_scans": apply_scans,
+                "duplicate": type(duplicate).__name__,
+                "duplicate_assistant": duplicate.assistant_message.content,
+                "duplicate_fresh": duplicate_fresh,
+            }))
+            """
+        )
+        payload = _payload(self, result)
+        self.assertEqual(payload["prepare_type"], "CommitAmbiguous")
+        self.assertTrue(payload["prepare_committed"])
+        self.assertEqual(payload["prepare_runner"], "AAAAAAAAAAAAAAAAAAAAAA")
+        prepared = payload["prepare_fresh"]
+        self.assertEqual(prepared["status"], "QUEUED")
+        self.assertEqual(prepared["blocks"], 1)
+        self.assertEqual(prepared["runner"], "AAAAAAAAAAAAAAAAAAAAAA")
+        self.assertEqual(prepared["slot_operation"], payload["prepare_operation"])
+        self.assertEqual(prepared["slot_runner"], "AAAAAAAAAAAAAAAAAAAAAA")
+        self.assertIsNone(prepared["started"])
+        self.assertEqual(prepared["slot_reservation"], 100_000 + 60_000_000)
+        self.assertIsNone(prepared["slot_lease"])
+        self.assertEqual(prepared["key_count"], 1)
+        self.assertEqual(prepared["operation_count"], 1)
+        self.assertEqual(prepared["messages"], [])
+        self.assertEqual(payload["prepare_scans"][-5:], [
+            "slot_correspondence",
+            "operation_owner",
+            "idempotency_binding",
+            "message_status",
+            "retry_eligibility",
+        ])
+        self.assertEqual(payload["repeated"], "Existing")
+        self.assertEqual(payload["repeated_operation"], payload["prepare_operation"])
+        self.assertEqual(payload["after_repeat"]["operation_count"], 1)
+        self.assertEqual(payload["after_repeat"]["key_count"], 1)
+        self.assertEqual(payload["claim_type"], "CommitAmbiguous")
+        self.assertTrue(payload["claim_committed"])
+        self.assertEqual(payload["claim_operation"], payload["prepare_operation"])
+        self.assertEqual(payload["claim_runner"], "AAAAAAAAAAAAAAAAAAAAAA")
+        self.assertEqual(payload["provider_calls"], 0)
+        claimed = payload["claim_fresh"]
+        self.assertEqual(claimed["status"], "RUNNING")
+        self.assertEqual(claimed["blocks"], 1)
+        self.assertEqual(claimed["runner"], "AAAAAAAAAAAAAAAAAAAAAA")
+        self.assertEqual(claimed["started"], payload["claim_at"])
+        self.assertEqual(claimed["deadline"], payload["claim_at"] + 600_000_000)
+        self.assertEqual(claimed["lease"], payload["claim_at"] + 720_000_000)
+        self.assertEqual(claimed["slot_operation"], payload["prepare_operation"])
+        self.assertEqual(claimed["slot_runner"], "AAAAAAAAAAAAAAAAAAAAAA")
+        self.assertIsNone(claimed["slot_reservation"])
+        self.assertEqual(claimed["slot_lease"], claimed["lease"])
+        self.assertEqual(claimed["messages"], [])
+        self.assertEqual(len(payload["claim_scans"]), 5)
+        self.assertEqual(payload["repeated_claim"], "NotQueued")
+        self.assertEqual(payload["apply_type"], "CommitAmbiguous")
+        self.assertTrue(payload["apply_committed"])
+        self.assertEqual(payload["apply_operation"], payload["prepare_operation"])
+        applied = payload["apply_fresh"]
+        self.assertEqual(applied["status"], "SUCCEEDED")
+        self.assertEqual(applied["blocks"], 0)
+        self.assertIsNone(applied["runner"])
+        self.assertEqual(applied["version"], 1)
+        self.assertEqual(applied["next_sequence"], 3)
+        self.assertEqual(
+            applied["messages"],
+            [
+                [1, "user", "prepare despite reported failure"],
+                [2, "assistant", "durable assistant"],
+            ],
+        )
+        self.assertIsNone(applied["slot_operation"])
+        self.assertEqual(applied["key_count"], 1)
+        self.assertEqual(applied["operation_count"], 1)
+        self.assertEqual(len(payload["apply_scans"]), 5)
+        self.assertEqual(payload["duplicate"], "AlreadySucceeded")
+        self.assertEqual(payload["duplicate_assistant"], "durable assistant")
+        self.assertEqual(payload["duplicate_fresh"]["version"], 1)
+        self.assertEqual(payload["duplicate_fresh"]["next_sequence"], 3)
+        self.assertEqual(payload["duplicate_fresh"]["messages"], applied["messages"])
+        self.assertEqual(payload["duplicate_fresh"]["operation_count"], 1)
+
+    def test_competing_writers_serialize_in_both_orders(self):
+        result = _run(
+            """\
+            from max_smart_db.repository import RetainedResult
+
+            clock = Clock(200_000)
+            repo = repository(clock)
+
+            def make_running(content, key_byte):
+                conversation_id = open_conversation(repo)
+                prepared = repo.prepare(command(
+                    OWNER.id,
+                    conversation_id,
+                    content,
+                    key_for(key_byte),
+                ))
+                claimed = repo.claim_running(
+                    OWNER.id,
+                    prepared.reservation.operation_id,
+                )
+                return claimed.claimed_operation
+
+            def make_unknown(content, key_byte):
+                token = make_running(content, key_byte)
+                repo.apply_failure(
+                    token,
+                    UncertainProviderCategory.PROVIDER_OUTCOME_UNCERTAIN,
+                )
+                clock.value = token.lease_expires_at
+                recovered = repo.recover_slot()
+                return token, type(recovered).__name__
+
+            apply_token = make_running("apply request", 31)
+            connection.close()
+
+            def apply_outcome(token):
+                outcome = repository(Clock(token.lease_expires_at)).apply_success(
+                    token,
+                    "race assistant",
+                )
+                return type(outcome).__name__
+
+            def recover_outcome(token):
+                outcome = repository(Clock(token.lease_expires_at)).recover_slot()
+                return type(outcome).__name__
+
+            apply_first = ordered_pair(
+                lambda: apply_outcome(apply_token),
+                lambda: recover_outcome(apply_token),
+            )
+            apply_first_fresh = fresh_snapshot(apply_token.operation_id)
+            apply_first_scans = startup_scans()
+            recover_token = make_running("recover request", 32)
+            connection.close()
+            recover_first = ordered_pair(
+                lambda: recover_outcome(recover_token),
+                lambda: apply_outcome(recover_token),
+            )
+            recover_first_fresh = fresh_snapshot(recover_token.operation_id)
+            recover_first_scans = startup_scans()
+
+            clock.value = 300_000
+            ack_token, ack_recovered = make_unknown("ack request", 33)
+            late_token, late_recovered = make_unknown("late request", 34)
+            occupant_conversation = open_conversation(repo)
+            occupant = repo.prepare(command(
+                OWNER.id,
+                occupant_conversation,
+                "occupant request",
+                key_for(35),
+            ))
+            occupant_claim = repo.claim_running(
+                OWNER.id,
+                occupant.reservation.operation_id,
+            )
+            occupant_id = str(occupant_claim.claimed_operation.operation_id)
+            occupant_before = slot()
+            connection.close()
+
+            def acknowledge_outcome(operation_id):
+                outcome = repository(Clock(400_000)).acknowledge_unknown(
+                    OWNER.id,
+                    operation_id,
+                )
+                return type(outcome).__name__
+
+            def reconcile_outcome(token):
+                outcome = repository(Clock(400_000)).reconcile_late_success(
+                    RetainedResult(
+                        claimed_operation=token,
+                        output_text="retained race assistant",
+                    )
+                )
+                return type(outcome).__name__
+
+            ack_first = ordered_pair(
+                lambda: acknowledge_outcome(ack_token.operation_id),
+                lambda: reconcile_outcome(ack_token),
+            )
+            ack_first_fresh = fresh_snapshot(ack_token.operation_id)
+            ack_first_scans = startup_scans()
+            late_first = ordered_pair(
+                lambda: reconcile_outcome(late_token),
+                lambda: acknowledge_outcome(late_token.operation_id),
+            )
+            late_first_fresh = fresh_snapshot(late_token.operation_id)
+            late_first_scans = startup_scans()
+            occupant_after = fresh_snapshot(
+                occupant_claim.claimed_operation.operation_id
+            )
+            print(json.dumps({
+                "setup": [ack_recovered, late_recovered],
+                "apply_first": apply_first,
+                "apply_first_fresh": apply_first_fresh,
+                "apply_first_scans": apply_first_scans,
+                "recover_first": recover_first,
+                "recover_first_fresh": recover_first_fresh,
+                "recover_first_scans": recover_first_scans,
+                "occupant_before": occupant_before["operation"],
+                "occupant_id": occupant_id,
+                "ack_first": ack_first,
+                "ack_first_fresh": ack_first_fresh,
+                "ack_first_scans": ack_first_scans,
+                "late_first": late_first,
+                "late_first_fresh": late_first_fresh,
+                "late_first_scans": late_first_scans,
+                "occupant_after": occupant_after,
+            }))
+            """
+        )
+        payload = _payload(self, result)
+        scans = [
+            "slot_correspondence",
+            "operation_owner",
+            "idempotency_binding",
+            "message_status",
+            "retry_eligibility",
+        ]
+        self.assertEqual(payload["setup"], [
+            "MarkedOutcomeUnknown",
+            "MarkedOutcomeUnknown",
+        ])
+        self.assertEqual(payload["apply_first"]["errors"], [])
+        self.assertEqual(payload["apply_first"]["first"], "Applied")
+        self.assertEqual(payload["apply_first"]["second"], "SlotFree")
+        apply_first = payload["apply_first_fresh"]
+        self.assertEqual(apply_first["status"], "SUCCEEDED")
+        self.assertEqual(apply_first["version"], 1)
+        self.assertEqual(apply_first["next_sequence"], 3)
+        self.assertEqual(
+            apply_first["messages"],
+            [
+                [1, "user", "apply request"],
+                [2, "assistant", "race assistant"],
+            ],
+        )
+        self.assertIsNone(apply_first["slot_operation"])
+        self.assertEqual(payload["apply_first_scans"], scans)
+        self.assertEqual(payload["recover_first"]["errors"], [])
+        self.assertEqual(payload["recover_first"]["first"], "MarkedOutcomeUnknown")
+        self.assertEqual(payload["recover_first"]["second"], "RecoveredUnknown")
+        recover_first = payload["recover_first_fresh"]
+        self.assertEqual(recover_first["status"], "OUTCOME_UNKNOWN")
+        self.assertEqual(recover_first["blocks"], 1)
+        self.assertIsNone(recover_first["acknowledged"])
+        self.assertEqual(recover_first["version"], 0)
+        self.assertEqual(recover_first["next_sequence"], 1)
+        self.assertEqual(recover_first["messages"], [])
+        self.assertIsNone(recover_first["slot_operation"])
+        self.assertEqual(payload["recover_first_scans"], scans)
+        self.assertEqual(payload["ack_first"]["errors"], [])
+        self.assertEqual(payload["ack_first"]["first"], "Acknowledged")
+        self.assertEqual(payload["ack_first"]["second"], "AcknowledgedDiscard")
+        acknowledged = payload["ack_first_fresh"]
+        self.assertEqual(acknowledged["status"], "OUTCOME_UNKNOWN")
+        self.assertEqual(acknowledged["blocks"], 0)
+        self.assertIsNotNone(acknowledged["acknowledged"])
+        self.assertEqual(acknowledged["category"], "provider_outcome_uncertain")
+        self.assertEqual(acknowledged["messages"], [])
+        self.assertEqual(acknowledged["version"], 0)
+        self.assertEqual(acknowledged["slot_operation"], payload["occupant_id"])
+        self.assertEqual(payload["ack_first_scans"], scans)
+        self.assertEqual(payload["late_first"]["errors"], [])
+        self.assertEqual(payload["late_first"]["first"], "Reconciled")
+        self.assertEqual(payload["late_first"]["second"], "NotUnknown")
+        retained = payload["late_first_fresh"]
+        self.assertEqual(retained["status"], "SUCCEEDED")
+        self.assertEqual(retained["version"], 1)
+        self.assertEqual(retained["next_sequence"], 3)
+        self.assertEqual(
+            retained["messages"],
+            [
+                [1, "user", "late request"],
+                [2, "assistant", "retained race assistant"],
+            ],
+        )
+        self.assertEqual(retained["category"], "provider_outcome_uncertain")
+        self.assertEqual(retained["slot_operation"], payload["occupant_id"])
+        self.assertEqual(payload["late_first_scans"], scans)
+        self.assertEqual(payload["occupant_before"], payload["occupant_id"])
+        self.assertEqual(payload["occupant_after"]["status"], "RUNNING")
+        self.assertEqual(payload["occupant_after"]["slot_operation"], payload["occupant_id"])
+        self.assertEqual(payload["occupant_after"]["messages"], [])
+
+    def test_overlapping_writers_block_inside_begin_immediate(self):
+        result = _run(
+            """\
+            from max_smart_db.repository import RetainedResult
+
+            clock = Clock(500_000)
+            repo = repository(clock)
+
+            def make_running(content, key_byte):
+                conversation_id = open_conversation(repo)
+                prepared = repo.prepare(command(
+                    OWNER.id,
+                    conversation_id,
+                    content,
+                    key_for(key_byte),
+                ))
+                claimed = repo.claim_running(
+                    OWNER.id,
+                    prepared.reservation.operation_id,
+                )
+                return claimed.claimed_operation
+
+            def make_unknown(content, key_byte):
+                token = make_running(content, key_byte)
+                repo.apply_failure(
+                    token,
+                    UncertainProviderCategory.PROVIDER_OUTCOME_UNCERTAIN,
+                )
+                clock.value = token.lease_expires_at
+                recovered = repo.recover_slot()
+                return token, type(recovered).__name__
+
+            def apply_outcome(token):
+                outcome = repository(Clock(token.lease_expires_at)).apply_success(
+                    token,
+                    "overlap assistant",
+                )
+                return type(outcome).__name__
+
+            def recover_outcome(token):
+                outcome = repository(Clock(token.lease_expires_at)).recover_slot()
+                return type(outcome).__name__
+
+            apply_token = make_running("overlap apply request", 41)
+            connection.close()
+            apply_wins = overlapping_writers(
+                lambda: apply_outcome(apply_token),
+                lambda: recover_outcome(apply_token),
+            )
+            apply_fresh = fresh_snapshot(apply_token.operation_id)
+            apply_scans = startup_scans()
+
+            recover_token = make_running("overlap recover request", 42)
+            connection.close()
+            recover_wins = overlapping_writers(
+                lambda: recover_outcome(recover_token),
+                lambda: apply_outcome(recover_token),
+            )
+            recover_fresh = fresh_snapshot(recover_token.operation_id)
+            recover_scans = startup_scans()
+
+            clock.value = 600_000
+            ack_token, ack_recovered = make_unknown("overlap ack request", 43)
+            late_token, late_recovered = make_unknown("overlap late request", 44)
+            occupant_conversation = open_conversation(repo)
+            occupant = repo.prepare(command(
+                OWNER.id,
+                occupant_conversation,
+                "overlap occupant request",
+                key_for(45),
+            ))
+            occupant_claim = repo.claim_running(
+                OWNER.id,
+                occupant.reservation.operation_id,
+            )
+            occupant_id = str(occupant_claim.claimed_operation.operation_id)
+            connection.close()
+
+            def acknowledge_outcome(operation_id):
+                outcome = repository(Clock(700_000)).acknowledge_unknown(
+                    OWNER.id,
+                    operation_id,
+                )
+                return type(outcome).__name__
+
+            def reconcile_outcome(token):
+                outcome = repository(Clock(700_000)).reconcile_late_success(
+                    RetainedResult(
+                        claimed_operation=token,
+                        output_text="overlap retained assistant",
+                    )
+                )
+                return type(outcome).__name__
+
+            ack_wins = overlapping_writers(
+                lambda: acknowledge_outcome(ack_token.operation_id),
+                lambda: reconcile_outcome(ack_token),
+            )
+            ack_fresh = fresh_snapshot(ack_token.operation_id)
+            ack_scans = startup_scans()
+            late_wins = overlapping_writers(
+                lambda: reconcile_outcome(late_token),
+                lambda: acknowledge_outcome(late_token.operation_id),
+            )
+            late_fresh = fresh_snapshot(late_token.operation_id)
+            late_scans = startup_scans()
+            occupant_after = fresh_snapshot(
+                occupant_claim.claimed_operation.operation_id
+            )
+            print(json.dumps({
+                "setup": [ack_recovered, late_recovered],
+                "occupant_id": occupant_id,
+                "apply_wins": apply_wins,
+                "apply_fresh": apply_fresh,
+                "apply_scans": apply_scans,
+                "recover_wins": recover_wins,
+                "recover_fresh": recover_fresh,
+                "recover_scans": recover_scans,
+                "ack_wins": ack_wins,
+                "ack_fresh": ack_fresh,
+                "ack_scans": ack_scans,
+                "late_wins": late_wins,
+                "late_fresh": late_fresh,
+                "late_scans": late_scans,
+                "occupant_after": occupant_after,
+            }))
+            """,
+            timeout=120,
+        )
+        payload = _payload(self, result)
+        scans = [
+            "slot_correspondence",
+            "operation_owner",
+            "idempotency_binding",
+            "message_status",
+            "retry_eligibility",
+        ]
+        self.assertEqual(payload["setup"], [
+            "MarkedOutcomeUnknown",
+            "MarkedOutcomeUnknown",
+        ])
+        self._assert_writer_overlap(payload["apply_wins"], "Applied", "SlotFree")
+        applied = payload["apply_fresh"]
+        self.assertEqual(applied["status"], "SUCCEEDED")
+        self.assertEqual(applied["blocks"], 0)
+        self.assertIsNone(applied["runner"])
+        self.assertEqual(applied["version"], 1)
+        self.assertEqual(applied["next_sequence"], 3)
+        self.assertEqual(
+            applied["messages"],
+            [
+                [1, "user", "overlap apply request"],
+                [2, "assistant", "overlap assistant"],
+            ],
+        )
+        self.assertIsNone(applied["slot_operation"])
+        self.assertEqual(payload["apply_scans"], scans)
+        self._assert_writer_overlap(
+            payload["recover_wins"],
+            "MarkedOutcomeUnknown",
+            "RecoveredUnknown",
+        )
+        recovered = payload["recover_fresh"]
+        self.assertEqual(recovered["status"], "OUTCOME_UNKNOWN")
+        self.assertEqual(recovered["blocks"], 1)
+        self.assertIsNone(recovered["acknowledged"])
+        self.assertEqual(recovered["version"], 0)
+        self.assertEqual(recovered["next_sequence"], 1)
+        self.assertEqual(recovered["messages"], [])
+        self.assertIsNone(recovered["slot_operation"])
+        self.assertEqual(payload["recover_scans"], scans)
+        self._assert_writer_overlap(
+            payload["ack_wins"],
+            "Acknowledged",
+            "AcknowledgedDiscard",
+        )
+        acknowledged = payload["ack_fresh"]
+        self.assertEqual(acknowledged["status"], "OUTCOME_UNKNOWN")
+        self.assertEqual(acknowledged["blocks"], 0)
+        self.assertIsNotNone(acknowledged["acknowledged"])
+        self.assertEqual(acknowledged["category"], "provider_outcome_uncertain")
+        self.assertEqual(acknowledged["messages"], [])
+        self.assertEqual(acknowledged["version"], 0)
+        self.assertEqual(acknowledged["slot_operation"], payload["occupant_id"])
+        self.assertEqual(payload["ack_scans"], scans)
+        self._assert_writer_overlap(
+            payload["late_wins"],
+            "Reconciled",
+            "NotUnknown",
+        )
+        retained = payload["late_fresh"]
+        self.assertEqual(retained["status"], "SUCCEEDED")
+        self.assertEqual(retained["blocks"], 0)
+        self.assertEqual(retained["version"], 1)
+        self.assertEqual(retained["next_sequence"], 3)
+        self.assertEqual(
+            retained["messages"],
+            [
+                [1, "user", "overlap late request"],
+                [2, "assistant", "overlap retained assistant"],
+            ],
+        )
+        self.assertEqual(retained["category"], "provider_outcome_uncertain")
+        self.assertEqual(retained["slot_operation"], payload["occupant_id"])
+        self.assertEqual(payload["late_scans"], scans)
+        self.assertEqual(payload["occupant_after"]["status"], "RUNNING")
+        self.assertEqual(payload["occupant_after"]["blocks"], 1)
+        self.assertEqual(
+            payload["occupant_after"]["slot_operation"],
+            payload["occupant_id"],
+        )
+        self.assertEqual(payload["occupant_after"]["messages"], [])
+
+    def _assert_writer_overlap(self, pair, winner, loser):
+        self.assertEqual(pair["errors"], [])
+        self.assertEqual(pair["winner"], winner)
+        self.assertEqual(pair["loser"], loser)
+        overlap = pair["overlap"]
+        self.assertEqual(overlap["winner_begin_sql"], "BEGIN IMMEDIATE")
+        self.assertEqual(overlap["loser_begin_sql"], "BEGIN IMMEDIATE")
+        self.assertTrue(overlap["winner_waited"])
+        self.assertLess(
+            overlap["winner_begin_returned"],
+            overlap["loser_begin_entered"],
+        )
+        self.assertLess(
+            overlap["loser_begin_entered"],
+            overlap["winner_commit_entered"],
+        )
+        self.assertLess(
+            overlap["winner_commit_entered"],
+            overlap["loser_begin_returned"],
+        )
 
 
 if __name__ == "__main__":
