@@ -43,6 +43,12 @@ class SqliteConversationRepository(SqliteConversationReader):
 
         return adopt_queued(self, actor_id, operation_id)
 
+    def claim_running(self, actor_id, operation_id):
+        """Claim one owned QUEUED reservation for provider execution."""
+        from .claim import claim_running
+
+        return claim_running(self, actor_id, operation_id)
+
     def recover_slot(self):
         """Classify or recover the singleton global slot."""
         from .recovery import recover_slot
