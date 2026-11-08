@@ -190,6 +190,12 @@ class CommitAmbiguous:
     operation_id: UUID | None = None
     runner_id: str | None = None
     claimed_at: int | None = None
+    conversation_id: UUID | None = None
+
+
+@dataclass(frozen=True)
+class ConversationConflict:
+    """An expected uniqueness conflict. It carries no row payload."""
 
 
 @dataclass(frozen=True)
@@ -485,7 +491,12 @@ AcknowledgeResult = Union[
     DatabaseBusy,
     CommitAmbiguous,
 ]
-CreateConversationResult = Union[ConversationView, DatabaseBusy, CommitAmbiguous]
+CreateConversationResult = Union[
+    ConversationView,
+    ConversationConflict,
+    DatabaseBusy,
+    CommitAmbiguous,
+]
 ReadConversationResult = Union[ConversationView, NotFound]
 ReadSnapshotResult = Union[Snapshot, NotFound]
 ReadOperationResult = Union[OperationView, NotFound]
