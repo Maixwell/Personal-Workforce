@@ -79,6 +79,12 @@ class SqliteConversationRepository(SqliteConversationReader):
 
         return recover_slot(self.clock)
 
+    def acknowledge_unknown(self, actor_id, operation_id):
+        """Acknowledge one unknown outcome without changing history."""
+        from .acknowledgement import acknowledge_unknown
+
+        return acknowledge_unknown(self, actor_id, operation_id)
+
     def create_conversation(self, actor_id, role_slug, title):
         """Insert one conversation and return its durable view."""
         require_explicit_positive_integer_id(actor_id)
