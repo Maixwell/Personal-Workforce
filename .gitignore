@@ -27,6 +27,15 @@ temp/
 data/current_session.json
 data/.current_session.json.*.tmp
 
+# Local SQLite data, sidecars, backups, and recovery work files
+data/*.sqlite3*
+data/*-wal
+data/*-shm
+data/backups/
+data/.backup-*
+data/.restore-*
+data/.migration-rehearsal-*
+
 # Personal context (local-only; do not commit)
 /docs/goals.md
 /docs/memory.md

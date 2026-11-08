@@ -142,6 +142,41 @@ git commit -m "Describe the completed milestone"
 
 Do not stage `.env`, personal context, or local conversation history.
 
+## Django database foundation
+
+Use `./.venv/bin/python -B manage.py <command>` as the only supported entry
+point for Django management commands. The project `manage.py` applies the
+database preflight and the current read-only command allowlist. Do not invoke
+`.venv/bin/django-admin` or `./.venv/bin/python -m django` directly: those
+entry points bypass both controls. Normal Django database connections still
+use the validating backend, but a command such as `dbshell` accesses SQLite
+outside that backend. This is an operational guardrail against mistakes, not
+a security boundary against the owner of the Mac.
+
+Database files are validated before and after SQLite opens them. The
+post-open checks revalidate the path, symbolic-link status, permissions,
+ownership, and hard-link constraints. They do not detect replacement by a
+different database file that otherwise satisfies all of those constraints
+and is owned by the current user. Such a swap requires write access to the
+`0700` data directory, so this remains an accepted race in the local,
+single-user threat model. A before-and-after identity snapshot was not added
+because it could detect some replacements but could not eliminate the race.
+
+Normal database connections never create a SQLite file. Explicit
+initialization is the only creation path, and it refuses to run if the
+database path or any corresponding `-wal`, `-shm`, or `-journal` path already
+exists. Creation reserves the database path exclusively so a concurrent file
+cannot be opened or truncated.
+
+Every database also requires a private
+`<database>.initialization-state` file containing the exact approved READY
+marker. Initialization durably writes an INCOMPLETE marker before creating
+the database and atomically replaces it with an fsynced READY marker only
+after SQLite setup, close, and post-creation checks succeed. Missing,
+malformed, INCOMPLETE, or transient marker files fail closed. A failure after
+the atomic marker replacement is reported as commit-uncertain and requires
+owner inspection; initialization never deletes or repairs database artifacts.
+
 ## Current limitations
 
 - Execution is synchronous.
