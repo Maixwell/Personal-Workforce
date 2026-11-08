@@ -61,6 +61,12 @@ class SqliteConversationRepository(SqliteConversationReader):
 
         return apply_failure(self, claimed, failure)
 
+    def apply_success(self, claimed, output_text):
+        """Atomically commit one successful RUNNING operation."""
+        from .apply_success import apply_success
+
+        return apply_success(self, claimed, output_text)
+
     def recover_slot(self):
         """Classify or recover the singleton global slot."""
         from .recovery import recover_slot
