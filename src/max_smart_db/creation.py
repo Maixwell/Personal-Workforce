@@ -49,6 +49,12 @@ class SqliteConversationRepository(SqliteConversationReader):
 
         return claim_running(self, actor_id, operation_id)
 
+    def fail_pre_provider(self, reservation, category):
+        """Record one definite pre-provider failure."""
+        from .pre_provider import fail_pre_provider
+
+        return fail_pre_provider(self, reservation, category)
+
     def recover_slot(self):
         """Classify or recover the singleton global slot."""
         from .recovery import recover_slot
