@@ -807,7 +807,6 @@ class RestartServiceTests(unittest.TestCase):
         for banned in (
             "acknowledge_unknown",
             "delete_expired_idempotency",
-            "retry_of",
             "GlobalModelSlot",
             "terminal",
             "session",

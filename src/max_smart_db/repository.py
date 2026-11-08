@@ -199,6 +199,67 @@ class ConversationConflict:
 
 
 @dataclass(frozen=True)
+class RetryCommand:
+    """Caller input for one explicit retry. The request text is not included."""
+
+    actor_id: int
+    source_operation_id: UUID
+    idempotency_key: str
+    expected_version: int
+
+
+@dataclass(frozen=True)
+class RetryPrepared:
+    """A new QUEUED retry. The warning is explicit for every eligible source."""
+
+    reservation: QueuedReservation
+    retry_of: UUID
+    duplicate_charge_warning: bool
+
+
+@dataclass(frozen=True)
+class RetryExisting:
+    """The new idempotency key is already bound to this retry."""
+
+    operation: OperationView
+    retry_of: UUID
+    duplicate_charge_warning: bool
+
+
+@dataclass(frozen=True)
+class RetrySourceNotEligible:
+    """The source cannot be the direct parent of a new retry."""
+
+
+@dataclass(frozen=True)
+class RetryCreationObserved:
+    """A fresh snapshot proved one committed retry reservation."""
+
+    operation_id: UUID
+    retry_of: UUID
+    runner_id: str
+    conversation_id: UUID
+    request_hash: str
+    fingerprint_version: int
+    expected_version: int
+    reservation_expires_at: int
+    duplicate_charge_warning: bool
+
+
+@dataclass(frozen=True)
+class RetryCreationNotProven:
+    """The fresh snapshot did not prove a committed retry."""
+
+
+@dataclass(frozen=True)
+class RetryUnconfirmed:
+    """Retry creation reported ambiguity and the fresh snapshot did not prove it."""
+
+    operation_id: UUID | None = None
+    runner_id: str | None = None
+
+
+@dataclass(frozen=True)
 class Prepared:
     reservation: QueuedReservation
 
@@ -479,6 +540,22 @@ PrepareResult = Union[
     DatabaseBusy,
     CommitAmbiguous,
 ]
+RetryCreateResult = Union[
+    RetryPrepared,
+    RetryExisting,
+    RetrySourceNotEligible,
+    KeyBindingMismatch,
+    StaleVersion,
+    ConversationBlocked,
+    ModelBusy,
+    NotFound,
+    DatabaseBusy,
+    CommitAmbiguous,
+]
+InspectRetryCreationResult = Union[
+    RetryCreationObserved,
+    RetryCreationNotProven,
+]
 AdoptResult = Union[
     Adopted,
     AlreadyOwned,
@@ -627,6 +704,19 @@ class ConversationRepository(Protocol):
 
     def prepare(self, command: PrepareCommand) -> PrepareResult:
         """Prepare one operation. Not implemented in R1."""
+
+    def create_retry(self, command: RetryCommand) -> RetryCreateResult:
+        """Create one explicit retry operation. Not implemented in R1."""
+
+    def inspect_committed_retry(
+        self,
+        actor_id: int,
+        operation_id: UUID,
+        source_operation_id: UUID,
+        runner_id: str,
+        idempotency_key: str,
+    ) -> InspectRetryCreationResult:
+        """Prove one committed retry and its key binding from a fresh snapshot."""
 
     def adopt_queued(
         self,

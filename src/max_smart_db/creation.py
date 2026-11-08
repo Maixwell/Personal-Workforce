@@ -85,6 +85,31 @@ class SqliteConversationRepository(SqliteConversationReader):
 
         return acknowledge_unknown(self, actor_id, operation_id)
 
+    def create_retry(self, command):
+        """Create one explicit retry without executing the source."""
+        from .retry_creation import create_retry
+
+        return create_retry(self, command)
+
+    def inspect_committed_retry(
+        self,
+        actor_id,
+        operation_id,
+        source_operation_id,
+        runner_id,
+        idempotency_key,
+    ):
+        """Prove one committed retry and its key binding from a fresh snapshot."""
+        from .retry_inspection import inspect_committed_retry
+
+        return inspect_committed_retry(
+            actor_id,
+            operation_id,
+            source_operation_id,
+            runner_id,
+            idempotency_key,
+        )
+
     def create_conversation(self, actor_id, role_slug, title):
         """Insert one conversation and return its durable view."""
         require_explicit_positive_integer_id(actor_id)

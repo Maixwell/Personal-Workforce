@@ -32,6 +32,10 @@ from max_smart_db.repository import (
     PreProviderFailureCategory,
     PreProviderFailureObserved,
     QueuedReservation,
+    RetryCommand,
+    RetryCreationObserved,
+    RetryPrepared,
+    RetryUnconfirmed,
     RecoveredUnknown,
     Reconciled,
     RetainedResult,
@@ -310,6 +314,91 @@ class ConversationService:
         if type(result) is CommitAmbiguous:
             return RecoveryUnconfirmed(operation_id=result.operation_id)
         return result
+
+    def create_retry(
+        self,
+        actor_id,
+        source_operation_id,
+        idempotency_key,
+        expected_version,
+    ):
+        """Create one explicit retry. This does not call the provider."""
+        _require_retry_request(
+            actor_id,
+            source_operation_id,
+            idempotency_key,
+            expected_version,
+        )
+        if not _outside_transaction():
+            return TransactionHeld()
+        result = self._repository.create_retry(RetryCommand(
+            actor_id=actor_id,
+            source_operation_id=source_operation_id,
+            idempotency_key=idempotency_key,
+            expected_version=expected_version,
+        ))
+        if type(result) is not CommitAmbiguous:
+            return result
+        return self._resolve_ambiguous_retry(
+            actor_id,
+            source_operation_id,
+            idempotency_key,
+            result,
+        )
+
+    def _resolve_ambiguous_retry(
+        self,
+        actor_id,
+        source_operation_id,
+        idempotency_key,
+        result,
+    ):
+        if (
+            not _outside_transaction()
+            or type(result.operation_id) is not UUID
+            or result.runner_id != self._repository.runner_id
+        ):
+            return RetryUnconfirmed(
+                operation_id=result.operation_id,
+                runner_id=result.runner_id,
+            )
+        try:
+            proof = self._repository.inspect_committed_retry(
+                actor_id,
+                result.operation_id,
+                source_operation_id,
+                result.runner_id,
+                idempotency_key,
+            )
+        except Exception:
+            return RetryUnconfirmed(
+                operation_id=result.operation_id,
+                runner_id=result.runner_id,
+            )
+        if (
+            type(proof) is not RetryCreationObserved
+            or proof.operation_id != result.operation_id
+            or proof.retry_of != source_operation_id
+            or proof.runner_id != result.runner_id
+        ):
+            return RetryUnconfirmed(
+                operation_id=result.operation_id,
+                runner_id=result.runner_id,
+            )
+        return RetryPrepared(
+            reservation=QueuedReservation(
+                operation_id=proof.operation_id,
+                actor_id=actor_id,
+                conversation_id=proof.conversation_id,
+                request_hash=proof.request_hash,
+                fingerprint_version=proof.fingerprint_version,
+                expected_version=proof.expected_version,
+                runner_id=proof.runner_id,
+                reservation_expires_at=proof.reservation_expires_at,
+            ),
+            retry_of=proof.retry_of,
+            duplicate_charge_warning=proof.duplicate_charge_warning,
+        )
 
     def _boundary(self, request):
         if request.adopt_operation_id is None:
@@ -699,6 +788,22 @@ def _confirmed_pre_provider(view, reservation, category):
         and observed is not None
         and observed.value == category.value
     )
+
+
+def _require_retry_request(
+    actor_id,
+    source_operation_id,
+    idempotency_key,
+    expected_version,
+):
+    if type(actor_id) is not int:
+        raise TypeError("actor_id_type")
+    if type(source_operation_id) is not UUID:
+        raise TypeError("source_operation_id_type")
+    if type(idempotency_key) is not str:
+        raise TypeError("idempotency_key_type")
+    if type(expected_version) is not int:
+        raise TypeError("expected_version_type")
 
 
 def _require_restart_identity(actor_id, operation_id):
