@@ -279,6 +279,39 @@ class ClaimNotConfirmed:
 
 
 @dataclass(frozen=True)
+class DurableSuccessObserved:
+    """A fresh snapshot proved one committed APPLY success and its two messages."""
+
+    operation_id: UUID
+    claimed_at: int
+    user_message: MessageView
+    assistant_message: MessageView
+
+
+@dataclass(frozen=True)
+class DurableFailureObserved:
+    """A fresh snapshot proved one committed definite provider failure."""
+
+    operation_id: UUID
+    claimed_at: int
+    failure_category: DefiniteProviderCategory
+
+
+@dataclass(frozen=True)
+class DurableUnknownObserved:
+    """A fresh snapshot proved one unacknowledged blocking unknown outcome."""
+
+    operation_id: UUID
+    runner_id: str
+    claimed_at: int
+
+
+@dataclass(frozen=True)
+class OutcomeNotProven:
+    """The snapshot did not prove a durable outcome."""
+
+
+@dataclass(frozen=True)
 class Failed:
     operation: OperationView
 
@@ -446,6 +479,13 @@ ClaimResult = Union[
     CommitAmbiguous,
 ]
 ConfirmDurableClaimResult = Union[DurableClaimConfirmed, ClaimNotConfirmed]
+InspectDurableOutcomeResult = Union[
+    DurableSuccessObserved,
+    DurableClaimConfirmed,
+    DurableUnknownObserved,
+    DurableFailureObserved,
+    OutcomeNotProven,
+]
 PreProviderFailureResult = Union[
     Failed,
     AlreadyFailed,
@@ -583,6 +623,15 @@ class ConversationRepository(Protocol):
         claimed_at: int,
     ) -> ConfirmDurableClaimResult:
         """Prove one committed RUNNING claim from a fresh read snapshot."""
+
+    def inspect_durable_outcome(
+        self,
+        actor_id: int,
+        operation_id: UUID,
+        runner_id: str,
+        claimed_at: int,
+    ) -> InspectDurableOutcomeResult:
+        """Classify one committed outcome from a fresh read snapshot."""
 
     def fail_pre_provider(
         self,

@@ -72,6 +72,23 @@ class SqliteConversationReader:
             claimed_at,
         )
 
+    def inspect_durable_outcome(
+        self,
+        actor_id,
+        operation_id,
+        runner_id,
+        claimed_at,
+    ):
+        """Classify one committed outcome without writing."""
+        from .outcome_inspection import inspect_durable_outcome
+
+        return inspect_durable_outcome(
+            actor_id,
+            operation_id,
+            runner_id,
+            claimed_at,
+        )
+
     def load_snapshot(self, actor_id, conversation_id):
         """Return one owned snapshot from a single deferred read."""
         _require_actor(actor_id)
