@@ -35,6 +35,51 @@ class StoredFailureCategory(Enum):
     PERSISTENCE_FAILED = "persistence_failed"
 
 
+class OperationStatus(Enum):
+    """Statuses permitted by the frozen operation status check."""
+
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
+    CANCELLED = "CANCELLED"
+
+
+class MessageRole(Enum):
+    """Roles permitted by the frozen message role check."""
+
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+class PreProviderFailureCategory(Enum):
+    """Definite failure categories valid before the provider boundary."""
+
+    CONTEXT_UNAVAILABLE = "context_unavailable"
+    CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded"
+    MODEL_CONFIGURATION_INVALID = "model_configuration_invalid"
+
+
+class DefiniteProviderCategory(Enum):
+    """Stored categories valid for a definite provider failure."""
+
+    PROVIDER_DEFINITE_FAILURE = "provider_definite_failure"
+    PROVIDER_OUTPUT_INVALID = "provider_output_invalid"
+
+
+class UncertainProviderCategory(Enum):
+    """Stored category valid for an uncertain provider outcome."""
+
+    PROVIDER_OUTCOME_UNCERTAIN = "provider_outcome_uncertain"
+
+
+ProviderFailureInput = Union[
+    DefiniteProviderCategory,
+    UncertainProviderCategory,
+]
+
+
 class RepositoryIntegrityError(RuntimeError):
     """Redacted integrity failure. It carries no row content."""
 
@@ -101,8 +146,9 @@ class MessageView:
     message_id: UUID
     conversation_id: UUID
     sequence: int
-    role: str
+    role: MessageRole
     content: str
+    operation_id: UUID | None
 
 
 @dataclass(frozen=True)
@@ -116,12 +162,13 @@ class OperationView:
     operation_id: UUID
     actor_id: int
     conversation_id: UUID
-    status: str
+    status: OperationStatus
     runner_id: str | None
     request_hash: str
     fingerprint_version: int
     expected_version: int
-    failure_category: str | None
+    provider_started_at: int | None
+    failure_category: StoredFailureCategory | None
     blocks_conversation: bool
     acknowledged: bool
 
@@ -168,7 +215,7 @@ class StaleVersion:
 @dataclass(frozen=True)
 class ConversationBlocked:
     operation_id: UUID
-    status: str
+    status: OperationStatus
 
 
 @dataclass(frozen=True)
@@ -228,7 +275,11 @@ class Applied:
 
 @dataclass(frozen=True)
 class AlreadySucceeded:
+    """Previously committed operation and its two linked messages."""
+
     operation: OperationView
+    user_message: MessageView
+    assistant_message: MessageView
 
 
 @dataclass(frozen=True)
@@ -238,7 +289,7 @@ class RecoveredUnknown:
 
 @dataclass(frozen=True)
 class InvalidState:
-    state: str
+    state: OperationStatus
 
 
 @dataclass(frozen=True)
@@ -334,7 +385,7 @@ class AlreadyAcknowledged:
 
 @dataclass(frozen=True)
 class NotUnknown:
-    current_state: str
+    current_state: OperationStatus
 
 
 @dataclass(frozen=True)
@@ -438,6 +489,7 @@ CreateConversationResult = Union[ConversationView, DatabaseBusy, CommitAmbiguous
 ReadConversationResult = Union[ConversationView, NotFound]
 ReadSnapshotResult = Union[Snapshot, NotFound]
 ReadOperationResult = Union[OperationView, NotFound]
+ReadMessagesResult = Union[tuple[MessageView, ...], NotFound]
 CleanupOperationResult = Union[CleanupResult, DatabaseBusy, CommitAmbiguous]
 
 
@@ -474,8 +526,11 @@ class ConversationRepository(Protocol):
         actor_id: int,
         conversation_id: UUID,
         after_sequence: int | None = None,
-    ) -> tuple[MessageView, ...]:
-        """Read actor-scoped messages. Not implemented in R1."""
+    ) -> ReadMessagesResult:
+        """Read actor-scoped messages. Missing and cross-owner return NotFound.
+
+        Not implemented in R1.
+        """
 
     def prepare(self, command: PrepareCommand) -> PrepareResult:
         """Prepare one operation. Not implemented in R1."""
@@ -497,7 +552,7 @@ class ConversationRepository(Protocol):
     def fail_pre_provider(
         self,
         reservation: QueuedReservation,
-        category: StoredFailureCategory,
+        category: PreProviderFailureCategory,
     ) -> PreProviderFailureResult:
         """Record a definite pre-provider failure. Not implemented in R1."""
 
@@ -511,9 +566,9 @@ class ConversationRepository(Protocol):
     def apply_failure(
         self,
         claimed: ClaimedOperation,
-        failure: FailureClassification,
+        failure: ProviderFailureInput,
     ) -> ApplyFailureResult:
-        """Apply one provider failure classification. Not implemented in R1."""
+        """Apply one definite or uncertain provider outcome. Not implemented in R1."""
 
     def reconcile_late_success(
         self,
