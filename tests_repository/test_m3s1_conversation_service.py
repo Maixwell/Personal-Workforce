@@ -637,17 +637,21 @@ class ConversationServiceTests(unittest.TestCase):
             operation = Operation.objects.get(owner_id=OWNER.id)
             print(json.dumps({
                 **public(outcome, box),
+                "category": outcome.failure_category.value,
                 "state": state(operation.id),
             }))
             """
         )
         payload = _payload(self, result)
-        self.assertEqual(payload["type"], "ContextUnavailable")
+        self.assertEqual(payload["type"], "DurablePreProviderFailure")
+        self.assertEqual(payload["category"], "context_unavailable")
         self.assertEqual(payload["provider"], 0)
         self.assertEqual(payload["claims"], 0)
         self.assertEqual(payload["confirms"], 0)
         self.assertEqual(payload["context"], 1)
-        self.assertEqual(payload["state"]["status"], "QUEUED")
+        self.assertEqual(payload["state"]["status"], "FAILED")
+        self.assertIsNone(payload["state"]["started"])
+        self.assertIsNone(payload["state"]["slot_reservation"])
         self.assertEqual(payload["messages"], 0)
 
     def test_outer_transaction_skips_context_and_provider(self):
@@ -948,7 +952,6 @@ class ConversationServiceTests(unittest.TestCase):
             "GlobalModelSlot",
             "apply_success",
             "apply_failure",
-            "fail_pre_provider",
             "recover_slot",
             "terminal",
             "session",

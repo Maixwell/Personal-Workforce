@@ -22,10 +22,15 @@ from max_smart_db.repository import (
     DurableSuccessObserved,
     DurableUnknownObserved,
     OperationStatus,
+    AlreadyFailed,
+    Failed,
     OperationView,
     OutcomeNotProven,
     PrepareCommand,
     Prepared,
+    PreProviderFailureCategory,
+    PreProviderFailureObserved,
+    QueuedReservation,
     RecoveredUnknown,
     Reconciled,
     RetainedResult,
@@ -102,6 +107,30 @@ class ContextUnavailable:
     operation_id: UUID
 
 
+class StandingContextRejection(Exception):
+    """An approved failure reported before provider execution."""
+
+    def __init__(self, category):
+        super().__init__("standing_context_rejected")
+        self.category = category
+
+
+@dataclass(frozen=True)
+class DurablePreProviderFailure:
+    """A definite pre-provider failure is durably recorded."""
+
+    operation_id: UUID
+    failure_category: PreProviderFailureCategory
+
+
+@dataclass(frozen=True)
+class PreProviderFailureUnconfirmed:
+    """A pre-provider failure write was not confirmed."""
+
+    operation_id: UUID
+    runner_id: str
+
+
 @dataclass(frozen=True)
 class TransactionHeld:
     """A caller transaction was open, so context and the provider were skipped."""
@@ -146,9 +175,10 @@ class ConversationService:
         if not _outside_transaction():
             return TransactionHeld()
 
-        operation_id = self._boundary(request)
-        if type(operation_id) is not UUID:
-            return operation_id
+        reservation = self._boundary(request)
+        if type(reservation) is not QueuedReservation:
+            return reservation
+        operation_id = reservation.operation_id
         if not _outside_transaction():
             return TransactionHeld()
         try:
@@ -158,10 +188,20 @@ class ConversationService:
                 operation_id=operation_id,
                 request_content=request.request_content,
             )
+        except StandingContextRejection as rejected:
+            return self._reject_before_provider(reservation, rejected.category)
         except Exception:
-            return ContextUnavailable(operation_id=operation_id)
+            return self._record_pre_provider(
+                reservation,
+                PreProviderFailureCategory.CONTEXT_UNAVAILABLE,
+            )
+        if type(context) is StandingContextRejection:
+            return self._reject_before_provider(reservation, context.category)
         if type(context) is not str:
-            return ContextUnavailable(operation_id=operation_id)
+            return self._record_pre_provider(
+                reservation,
+                PreProviderFailureCategory.CONTEXT_UNAVAILABLE,
+            )
         if not _outside_transaction():
             return TransactionHeld()
 
@@ -212,7 +252,7 @@ class ConversationService:
             )
             if type(prepared) is not Prepared:
                 return prepared
-            return prepared.reservation.operation_id
+            return prepared.reservation
 
         adopted = self._repository.adopt_queued(
             request.actor_id,
@@ -222,7 +262,51 @@ class ConversationService:
             return adopted
         if adopted.reservation.runner_id != request.runner_id:
             return adopted
-        return adopted.reservation.operation_id
+        return adopted.reservation
+
+    def _reject_before_provider(self, reservation, category):
+        if type(category) is not PreProviderFailureCategory:
+            return StandingContextRejection(category)
+        return self._record_pre_provider(reservation, category)
+
+    def _record_pre_provider(self, reservation, category):
+        if not _outside_transaction():
+            return _pre_provider_unconfirmed(reservation)
+        try:
+            result = self._repository.fail_pre_provider(reservation, category)
+        except Exception:
+            return _pre_provider_unconfirmed(reservation)
+        if type(result) is Failed or type(result) is AlreadyFailed:
+            if _confirmed_pre_provider(result.operation, reservation, category):
+                return DurablePreProviderFailure(
+                    operation_id=reservation.operation_id,
+                    failure_category=category,
+                )
+            return result
+        if type(result) is not CommitAmbiguous:
+            return result
+        return self._resolve_ambiguous_pre_provider(reservation)
+
+    def _resolve_ambiguous_pre_provider(self, reservation):
+        if not _outside_transaction():
+            return _pre_provider_unconfirmed(reservation)
+        try:
+            proof = self._repository.inspect_pre_provider_failure(
+                reservation.actor_id,
+                reservation.operation_id,
+                reservation.runner_id,
+            )
+        except Exception:
+            return _pre_provider_unconfirmed(reservation)
+        if (
+            type(proof) is PreProviderFailureObserved
+            and proof.operation_id == reservation.operation_id
+        ):
+            return DurablePreProviderFailure(
+                operation_id=proof.operation_id,
+                failure_category=proof.failure_category,
+            )
+        return _pre_provider_unconfirmed(reservation)
 
     def _authorize(self, request, operation_id, claim):
         if type(claim) is Claimed:
@@ -517,3 +601,27 @@ def _unconfirmed(claimed, completion):
 
 def _outside_transaction():
     return connection.get_autocommit() and not connection.in_atomic_block
+
+
+def _pre_provider_unconfirmed(reservation):
+    return PreProviderFailureUnconfirmed(
+        operation_id=reservation.operation_id,
+        runner_id=reservation.runner_id,
+    )
+
+
+def _confirmed_pre_provider(view, reservation, category):
+    observed = getattr(view, "failure_category", None)
+    return (
+        type(view) is OperationView
+        and view.operation_id == reservation.operation_id
+        and view.actor_id == reservation.actor_id
+        and view.conversation_id == reservation.conversation_id
+        and view.status is OperationStatus.FAILED
+        and view.provider_started_at is None
+        and view.runner_id is None
+        and view.blocks_conversation is False
+        and view.acknowledged is False
+        and observed is not None
+        and observed.value == category.value
+    )
