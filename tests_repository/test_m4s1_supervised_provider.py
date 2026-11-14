@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -11,6 +12,8 @@ import threading
 import time
 import unittest
 import uuid
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -20,7 +23,14 @@ PRODUCTION_DATABASE = PROJECT_ROOT / "data" / "max_smart.sqlite3"
 SESSION_FILE = PROJECT_ROOT / "data" / "current_session.json"
 sys.path.insert(0, str(SRC_ROOT))
 
-from provider_supervisor import build_service_provider, spawn_worker, supervise  # noqa: E402
+import provider_supervisor  # noqa: E402
+from provider_supervisor import (  # noqa: E402
+    _close_pipes,
+    _stop,
+    build_service_provider,
+    spawn_worker,
+    supervise,
+)
 
 
 SECRET = "sk-test-do-not-leak"
@@ -428,10 +438,10 @@ class SupervisedProviderTests(unittest.TestCase):
 
         def stop(process):
             calls["stop"] += 1
+            calls["pid"] = process.pid
             if calls["stop"] == 1:
                 return False
-            os.killpg(process.pid, 9)
-            process.wait(timeout=2)
+            _reap_worker(process)
             return True
 
         result = supervise(
@@ -448,7 +458,143 @@ class SupervisedProviderTests(unittest.TestCase):
         )
         self.assertEqual(result.classification, "uncertain")
         self.assertEqual(calls["popen"], 1)
-        self.assertGreaterEqual(calls["stop"], 2)
+        self.assertGreaterEqual(calls["stop"], 1)
+        self.assertTrue(_dead(calls["pid"]))
+
+    def test_vanished_group_reaps_child_without_signaling(self):
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, signal; os.killpg(os.getpgrp(), signal.SIGKILL)",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: _ensure_dead(process))
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.getpgid(process.pid)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("worker group did not exit")
+        hidden = _HidePoll(process)
+        with _recording_killpg() as seen:
+            stopped = _stop(hidden, None)
+        _close_pipes(hidden)
+        self.assertFalse(stopped)
+        self.assertEqual(seen, [])
+        self.assertIsNotNone(process.returncode)
+        self.assertTrue(process.stdout.closed)
+
+    def test_permission_error_reaps_exited_child_without_group_claim(self):
+        process, descendant = _leader_with_descendant()
+        self.addCleanup(lambda: _release_leader(process, descendant))
+
+        def deny(group, _sig):
+            os.kill(group, signal.SIGKILL)
+            raise PermissionError(1, "Operation not permitted")
+
+        with _recording_killpg(deny) as seen:
+            stopped = _stop(process, None)
+        _close_pipes(process)
+        self.assertFalse(stopped)
+        self.assertEqual(seen, [process.pid])
+        self.assertNotIn(os.getpgrp(), seen)
+        self.assertIsNotNone(process.returncode)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(_alive(descendant))
+
+    def test_permission_error_does_not_claim_a_running_child_stopped(self):
+        process, descendant = _leader_with_descendant()
+        self.addCleanup(lambda: _release_leader(process, descendant))
+
+        def deny(_group, _sig):
+            raise PermissionError(1, "Operation not permitted")
+
+        started = time.monotonic()
+        with _recording_killpg(deny) as seen:
+            stopped = _stop(process, None)
+        elapsed = time.monotonic() - started
+        self.assertFalse(stopped)
+        self.assertEqual(seen, [process.pid])
+        self.assertNotIn(os.getpgrp(), seen)
+        self.assertIsNone(process.returncode)
+        self.assertIsNone(process.poll())
+        self.assertTrue(_alive(descendant))
+        self.assertGreater(elapsed, 1.5)
+        self.assertLess(elapsed, 2.5)
+
+    def test_owned_group_stop_reaps_leader_and_descendant(self):
+        process, descendant = _leader_with_descendant()
+        self.addCleanup(lambda: _release_leader(process, descendant))
+        parent = os.getpgrp()
+        with _recording_killpg() as seen:
+            stopped = _stop(process, None)
+        _close_pipes(process)
+        self.assertTrue(stopped)
+        self.assertEqual(seen, [process.pid])
+        self.assertNotIn(parent, seen)
+        self.assertEqual(process.returncode, -signal.SIGKILL)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(_dead(descendant))
+
+    def test_running_child_in_supervisor_group_is_not_signaled(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.3)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=False,
+        )
+        self.addCleanup(lambda: _reap_direct(process))
+        self.assertIsNone(process.poll())
+        self.assertEqual(os.getpgid(process.pid), os.getpgrp())
+        with _recording_killpg() as seen:
+            stopped = _stop(process, None)
+        self.assertFalse(stopped)
+        self.assertEqual(seen, [])
+        self.assertIsNotNone(process.returncode)
+
+    def test_deadline_reaps_worker_without_another_request(self):
+        for _ in range(5):
+            server = _listen(self)
+            held = {}
+
+            def popen(*args, **kwargs):
+                process = subprocess.Popen(*args, **kwargs)
+                held["process"] = process
+                held["count"] = held.get("count", 0) + 1
+                return process
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = supervise(
+                    claimed_at=CLAIMED_AT,
+                    operation_id=OPERATION,
+                    runner_id=RUNNER,
+                    request_content="hello",
+                    standing_context="standing",
+                    wall_clock=lambda: CLAIMED_AT + ALLOWANCE_US - 400_000,
+                    fake="frame_then_block",
+                    socket_port=server.getsockname()[1],
+                    popen=popen,
+                )
+            process = held["process"]
+            self.addCleanup(lambda current=process: _ensure_dead(current))
+            self.assertEqual(result.classification, "uncertain")
+            self.assertIsNone(result.output)
+            self.assertEqual(held["count"], 1)
+            self.assertIsNotNone(process.returncode)
+            self.assertTrue(process.stdout.closed)
+            self.assertFalse(
+                any(item.category is ResourceWarning for item in caught)
+            )
 
     def test_service_integration_uses_disposable_database(self):
         payload = _payload(self, _run(
@@ -793,14 +939,174 @@ def _child_env():
     }
 
 
-def _ensure_dead(process):
+_DESCENDANT_LEADER = """\
+import subprocess
+import sys
+import time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+sys.stdout.write("%s\\n" % child.pid)
+sys.stdout.flush()
+time.sleep(30)
+"""
+
+
+class _HidePoll:
+    """Present a still-unreaped child without hiding the real wait."""
+
+    def __init__(self, process):
+        self._process = process
+        self.pid = process.pid
+        self.stdout = process.stdout
+        self.args = process.args
+        self.returncode = None
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        self.returncode = self._process.wait(timeout=timeout)
+        return self.returncode
+
+
+def _leader_with_descendant():
+    process = subprocess.Popen(
+        [sys.executable, "-c", _DESCENDANT_LEADER],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    line = process.stdout.readline()
+    if process.poll() is not None or not line.strip():
+        process.wait(timeout=2)
+        raise AssertionError("leader exited before publishing its descendant")
+    return process, int(line)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _release_leader(process, descendant):
+    if _alive(descendant):
+        _signal_recorded_group(process.pid, descendant)
+    elif process.poll() is None:
+        _signal_recorded_group(process.pid, process.pid)
     if process.poll() is None:
         try:
-            os.killpg(process.pid, 9)
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    if process.stdout is not None and not process.stdout.closed:
+        process.stdout.close()
+
+
+def _signal_recorded_group(leader_pid, pid):
+    try:
+        group = os.getpgid(pid)
+    except OSError:
+        return
+    if group != leader_pid or group == os.getpgrp():
+        return
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except OSError:
+        return
+
+
+def _reap_direct(process):
+    if process.poll() is None:
+        try:
+            os.kill(process.pid, signal.SIGKILL)
         except OSError:
             pass
-        process.wait(timeout=2)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
     if process.stdout is not None and not process.stdout.closed:
+        process.stdout.close()
+
+
+@contextmanager
+def _recording_killpg(replacement=None):
+    real = provider_supervisor.os.killpg
+    seen = []
+
+    def wrapped(group, sig):
+        seen.append(group)
+        if group == os.getpgrp() or group <= 0:
+            raise AssertionError(f"refusing recorded signal for group {group}")
+        if replacement is None:
+            return real(group, sig)
+        return replacement(group, sig)
+
+    provider_supervisor.os.killpg = wrapped
+    try:
+        yield seen
+    finally:
+        provider_supervisor.os.killpg = real
+
+
+def _own_worker_group(pid):
+    """Return the worker's own process group, or None when that group is gone.
+
+    A supervised worker is started as a session leader, so its process-group
+    id equals its pid. Signaling is refused when that is no longer true, when
+    the group is this test's group, or when the group has already exited.
+    """
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or pid == os.getpid()
+    ):
+        raise AssertionError(f"refusing to signal pid {pid}")
+    try:
+        group = os.getpgid(pid)
+    except ProcessLookupError:
+        return None
+    if group == os.getpgrp() or group != pid:
+        raise AssertionError(f"refusing to signal group {group} for pid {pid}")
+    return group
+
+
+def _signal_own_worker_group(pid):
+    group = _own_worker_group(pid)
+    if group is None:
+        return "gone"
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "denied"
+    return "signaled"
+
+
+def _reap_worker(process):
+    outcome = _signal_own_worker_group(process.pid)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        if outcome == "denied" or process.poll() is None:
+            raise
+    if process.poll() is None:
+        raise subprocess.TimeoutExpired(process.args, 2)
+    if process.stdout is not None and not process.stdout.closed:
+        process.stdout.close()
+
+
+def _ensure_dead(process):
+    if process.poll() is None:
+        _reap_worker(process)
+    elif process.stdout is not None and not process.stdout.closed:
         process.stdout.close()
 
 
@@ -809,10 +1115,14 @@ def _kill_if_alive(pid):
         os.kill(pid, 0)
     except OSError:
         return
+    outcome = _signal_own_worker_group(pid)
+    if outcome != "denied":
+        return
     try:
-        os.killpg(pid, 9)
+        os.kill(pid, 0)
     except OSError:
-        pass
+        return
+    raise PermissionError(f"worker {pid} remained signalable after killpg was denied")
 
 
 def _run(body, *, timeout=60):

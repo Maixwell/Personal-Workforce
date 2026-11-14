@@ -248,21 +248,47 @@ def _close_pipes(proc):
 
 
 def _stop(proc, stop):
+    """Reap one directly owned worker.
+
+    True means SIGKILL was delivered to that worker's own process group and
+    this direct child was reaped. A group that is already gone, or a killpg
+    failure, still reaps an exited child through wait, but that reap does not
+    claim descendants were signaled. A child that is still running is not
+    reported stopped.
+    """
+
     if stop is not None:
         return stop(proc)
-    if proc.poll() is not None:
-        return True
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        return False
+    already_reaped = proc.poll() is not None
+    signaled = False if already_reaped else _signal_owned_worker_group(proc.pid)
     try:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         return False
-    return proc.poll() is not None
+    return signaled and proc.returncode is not None
+
+
+def _signal_owned_worker_group(pid):
+    """SIGKILL the worker session, or False when that group is not established."""
+
+    if type(pid) is not int or pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        group = os.getpgid(pid)
+    except OSError:
+        return False
+    if (
+        type(group) is not int
+        or group <= 0
+        or group != pid
+        or group == os.getpgrp()
+    ):
+        return False
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except OSError:
+        return False
+    return True
 
 
 def _classify(frame, job, *, worker_started):
