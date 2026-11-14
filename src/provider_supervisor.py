@@ -6,6 +6,7 @@ No proof, a missed cutoff, or a lost control channel withholds GO. The
 original allowance is not extended while the handshake waits.
 """
 
+import ctypes
 import json
 import os
 import select
@@ -14,6 +15,7 @@ import socket
 import subprocess
 import sys
 import time
+from ctypes.util import find_library
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -236,7 +238,7 @@ def supervise(
             on_worker_start(proc.pid)
         return _finish(proc, deadline_ns, job, stop)
     finally:
-        if proc is not None and proc.poll() is None:
+        if proc is not None and proc.returncode is None:
             _stop(proc, stop)
         _close_control(control)
         if proc is not None:
@@ -263,17 +265,13 @@ def _budget(claimed_at, wall_clock):
 
 def _finish(proc, deadline_ns, job, stop):
     frame = _read_until(proc, deadline_ns)
-    if proc.poll() is None and _has_line(frame):
-        remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
-        if remaining > 0:
-            try:
-                proc.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                pass
+    if _has_line(frame) and _direct_child_state(proc.pid) == "alive":
+        _pause_until_exit(proc.pid, deadline_ns)
     now = time.monotonic_ns()
-    if proc.poll() is None or now >= deadline_ns:
+    if _direct_child_state(proc.pid) == "alive" or now >= deadline_ns:
         _stop(proc, stop)
         return _uncertain(worker_started=True)
+    _reap_after_group_signal(proc)
     if proc.returncode != 0:
         return _uncertain(worker_started=True)
     return _classify(frame, job, worker_started=True)
@@ -283,7 +281,7 @@ def _read_until(proc, deadline_ns):
     descriptor = proc.stdout.fileno()
     buffer = bytearray()
     while time.monotonic_ns() < deadline_ns:
-        if proc.poll() is not None:
+        if _direct_child_state(proc.pid) != "alive":
             _drain(descriptor, buffer)
             break
         remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
@@ -325,47 +323,166 @@ def _close_pipes(proc):
 
 
 def _stop(proc, stop):
-    """Reap one directly owned worker.
+    """Reap one directly owned worker after a proven group signal, if any.
 
-    True means SIGKILL was delivered to that worker's own process group and
-    this direct child was reaped. A group that is already gone, or a killpg
-    failure, still reaps an exited child through wait, but that reap does not
-    claim descendants were signaled. A child that is still running is not
-    reported stopped.
+    True means SIGKILL reached that worker's own process group and this
+    direct child was reaped. A missing, mismatched, or already reaped group
+    is not signaled. A killpg failure still reaps an exited child, but that
+    reap does not claim descendants were signaled. A child that is still
+    running is not reported stopped.
     """
 
     if stop is not None:
         return stop(proc)
-    already_reaped = proc.poll() is not None
-    signaled = False if already_reaped else _signal_owned_worker_group(proc.pid)
+    return _reap_after_group_signal(proc)
+
+
+def _reap_after_group_signal(proc):
+    """Signal a proven worker group before the first reap, then wait."""
+
+    if proc.returncode is not None:
+        _close_pipes(proc)
+        return False
+    state = _direct_child_state(proc.pid)
+    signaled = False
+    if state == "alive":
+        signaled = _signal_owned_worker_group(proc.pid)
+        if not signaled and _direct_child_state(proc.pid) == "exited":
+            signaled = _signal_exited_leader_group(proc.pid)
+    elif state == "exited":
+        signaled = _signal_exited_leader_group(proc.pid)
     try:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         return False
+    except OSError:
+        return False
+    _close_pipes(proc)
     return signaled and proc.returncode is not None
 
 
 def _signal_owned_worker_group(pid):
-    """SIGKILL the worker session, or False when that group is not established."""
+    """SIGKILL a live worker session, or False when that group is not proven."""
 
     if type(pid) is not int or pid <= 0 or pid == os.getpid():
+        return False
+    if _direct_child_state(pid) != "alive":
         return False
     try:
         group = os.getpgid(pid)
     except OSError:
         return False
-    if (
-        type(group) is not int
-        or group <= 0
-        or group != pid
-        or group == os.getpgrp()
-    ):
+    if not _owned_group(pid, group):
         return False
     try:
         os.killpg(group, signal.SIGKILL)
     except OSError:
         return False
     return True
+
+
+def _signal_exited_leader_group(pid):
+    """SIGKILL the exited leader's group only while its pid remains unreaped.
+
+    macOS getpgid fails for a zombie session leader. A live member whose
+    group id is still that unreaped pid proves the original group. The pid
+    is never used as a signal target after it has been reaped.
+    """
+
+    if not _exited_group_has_live_member(pid):
+        return False
+    if _direct_child_state(pid) != "exited":
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    if not _owned_group(pid, pid):
+        return False
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        return False
+    return True
+
+
+def _owned_group(pid, group):
+    return (
+        type(group) is int
+        and group > 0
+        and group == pid
+        and group != os.getpgrp()
+        and group != os.getpid()
+    )
+
+
+def _direct_child_state(pid):
+    """Return alive, exited, or unproven. This wait does not reap the child."""
+
+    if type(pid) is not int or pid <= 0 or pid == os.getpid():
+        return "unproven"
+    try:
+        info = os.waitid(
+            os.P_PID,
+            pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except OSError:
+        return "unproven"
+    if info is None:
+        return "alive"
+    if getattr(info, "si_pid", None) != pid:
+        return "unproven"
+    return "exited"
+
+
+def _pause_until_exit(pid, deadline_ns):
+    while time.monotonic_ns() < deadline_ns:
+        if _direct_child_state(pid) != "alive":
+            return
+        remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+        if remaining <= 0:
+            return
+        time.sleep(min(0.05, remaining))
+
+
+def _exited_group_has_live_member(pid):
+    if _direct_child_state(pid) != "exited" or not _owned_group(pid, pid):
+        return False
+    for candidate in _process_ids():
+        if type(candidate) is not int or candidate <= 0 or candidate == pid:
+            continue
+        try:
+            group = os.getpgid(candidate)
+        except OSError:
+            continue
+        if group == pid and _direct_child_state(pid) == "exited":
+            return True
+    return False
+
+
+def _process_ids():
+    """Return currently listed pids, or none when the listing cannot be proven."""
+
+    try:
+        library = find_library("c")
+        if not library:
+            return ()
+        libc = ctypes.CDLL(library, use_errno=True)
+        list_pids = libc.proc_listallpids
+        list_pids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        list_pids.restype = ctypes.c_int
+        estimated = list_pids(None, 0)
+        if estimated <= 0 or estimated > 100_000:
+            return ()
+        capacity = estimated + 64
+        buffer = (ctypes.c_int * capacity)()
+        count = list_pids(buffer, ctypes.sizeof(buffer))
+    except (OSError, AttributeError):
+        return ()
+    if count <= 0 or count > capacity:
+        return ()
+    return tuple(buffer[index] for index in range(count))
 
 
 def _classify(frame, job, *, worker_started):
@@ -485,7 +602,7 @@ def _read_control(proc, control, deadline_ns):
         return None
     buffer = bytearray()
     while time.monotonic_ns() < deadline_ns:
-        if proc.poll() is not None:
+        if _direct_child_state(proc.pid) != "alive":
             return None
         remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
         if remaining <= 0:

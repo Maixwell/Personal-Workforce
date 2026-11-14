@@ -26,7 +26,13 @@ SESSION_FILE = PROJECT_ROOT / "data" / "current_session.json"
 sys.path.insert(0, str(SRC_ROOT))
 
 import provider_supervisor  # noqa: E402
-from provider_fence import prepare_disposable_fence, publish_shared_fence_config  # noqa: E402
+from provider_fence import (  # noqa: E402
+    FenceHeld,
+    acquire_exclusive,
+    prepare_disposable_fence,
+    publish_shared_fence_config,
+    release_fence,
+)
 from provider_supervisor import (  # noqa: E402
     _close_pipes,
     _stop,
@@ -403,6 +409,94 @@ class SupervisedProviderTests(unittest.TestCase):
         self.assertTrue(_dead(seen["worker"]))
         self.assertTrue(_dead(seen["child"]))
 
+    def test_leader_exit_terminates_only_its_descendant(self):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def accept_and_close():
+            try:
+                connection, _address = server.accept()
+            except OSError:
+                return
+            connection.close()
+
+        threading.Thread(target=accept_and_close, daemon=True).start()
+        self.addCleanup(server.close)
+        unrelated = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        def release_unrelated(process=unrelated):
+            _release_session(process.pid)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+        self.addCleanup(release_unrelated)
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / "ready"
+            with _recording_killpg() as seen:
+                result = supervise(
+                    claimed_at=CLAIMED_AT,
+                    operation_id=OPERATION,
+                    runner_id=RUNNER,
+                    request_content="hello",
+                    standing_context="standing",
+                    wall_clock=lambda: CLAIMED_AT,
+                    fake="block_read_child",
+                    socket_port=port,
+                    ready_path=str(ready),
+                )
+            info = json.loads(ready.read_text(encoding="utf-8"))
+        self.assertEqual(result.classification, "uncertain")
+        self.assertIsNone(result.output)
+        self.assertNotEqual(info["worker"], os.getpgrp())
+        self.assertNotIn(os.getpgrp(), seen)
+        self.assertTrue(all(group == info["worker"] for group in seen))
+        self.assertTrue(_dead(info["worker"]))
+        self.assertTrue(_dead(info["child"]))
+        self.assertTrue(_alive(unrelated.pid))
+        held = acquire_exclusive(_TEST_FENCE)
+        self.addCleanup(lambda: release_fence(held) if type(held) is FenceHeld else None)
+        self.assertIsInstance(held, FenceHeld)
+
+    def test_supervisor_death_kills_worker_and_descendant(self):
+        server = _listen(self)
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / "ready"
+            job = _job(
+                time.monotonic_ns() + 20_000_000_000,
+                fake="block_read_child",
+                socket_port=server.getsockname()[1],
+                ready_path=str(ready),
+            )
+            launcher = subprocess.Popen(
+                [sys.executable, "-c", _LAUNCHER],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_child_env(),
+            )
+            stdout, stderr = launcher.communicate(
+                json.dumps(job).encode("utf-8"),
+                timeout=5,
+            )
+            self.assertEqual(launcher.returncode, 0, stderr.decode())
+            info = json.loads(ready.read_text(encoding="utf-8"))
+        worker_pid = int(stdout.decode().strip())
+        self.addCleanup(lambda: _release_session_member(worker_pid, info["child"]))
+        self.assertEqual(info["worker"], worker_pid)
+        self.assertNotEqual(worker_pid, os.getpgrp())
+        self.assertTrue(_dead(worker_pid))
+        self.assertTrue(_dead(info["child"]))
+
     def test_crash_and_partial_frame_are_uncertain(self):
         for scenario in ("crash", "partial"):
             with self.subTest(scenario=scenario):
@@ -773,6 +867,48 @@ class SupervisedProviderTests(unittest.TestCase):
         self.assertEqual(process.returncode, -signal.SIGKILL)
         self.assertTrue(process.stdout.closed)
         self.assertTrue(_dead(descendant))
+
+    def test_exited_leader_is_signaled_before_reap(self):
+        process, descendant = _leader_with_descendant()
+        self.addCleanup(lambda: _release_leader(process, descendant))
+        os.kill(process.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.getpgid(process.pid)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("leader did not become unreaped")
+        self.assertTrue(_alive(descendant))
+        self.assertIsNone(process.returncode)
+        self.assertNotEqual(process.pid, os.getpgrp())
+        with _recording_killpg() as seen:
+            stopped = _stop(process, None)
+        self.assertTrue(stopped)
+        self.assertEqual(seen, [process.pid])
+        self.assertNotIn(os.getpgrp(), seen)
+        self.assertIsNotNone(process.returncode)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(_dead(descendant))
+
+    def test_reaped_worker_is_not_signaled(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import os; os._exit(0)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: _ensure_dead(process))
+        process.wait(timeout=2)
+        with _recording_killpg() as seen:
+            stopped = _stop(process, None)
+        self.assertFalse(stopped)
+        self.assertEqual(seen, [])
+        self.assertNotIn(os.getpgrp(), seen)
+        self.assertTrue(process.stdout.closed)
 
     def test_running_child_in_supervisor_group_is_not_signaled(self):
         process = subprocess.Popen(
@@ -1271,6 +1407,20 @@ def _leader_with_descendant():
         process.wait(timeout=2)
         raise AssertionError("leader exited before publishing its descendant")
     return process, int(line)
+
+
+def _release_session(pid):
+    if _alive(pid):
+        _signal_own_worker_group(pid)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and _alive(pid):
+        time.sleep(0.02)
+
+
+def _release_session_member(leader_pid, member_pid):
+    if _alive(member_pid) or _alive(leader_pid):
+        target = member_pid if _alive(member_pid) else leader_pid
+        _signal_recorded_group(leader_pid, target)
 
 
 def _alive(pid):
