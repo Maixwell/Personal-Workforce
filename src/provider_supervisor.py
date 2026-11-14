@@ -3,7 +3,9 @@
 The worker, not this supervisor, holds the global provider fence. After the
 worker reports LOCKED, a fresh durable claim proof is required before GO.
 No proof, a missed cutoff, or a lost control channel withholds GO. The
-original allowance is not extended while the handshake waits.
+original allowance is not extended while the handshake waits. An unsafe
+two-sample clock reading refuses dispatch before a worker starts and does
+not change that allowance.
 """
 
 import ctypes
@@ -20,6 +22,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from max_smart_db.application_validation import SIGNED_INT64_MAX
+from max_smart_db.clock_safety import (
+    ClockSampleAccepted,
+    MonotonicNanosecondClock,
+    UtcMicrosecondClock,
+    sample_clock_safety,
+)
 from max_smart_db.config import (
     EXECUTION_DEADLINE_US,
     RECOVERY_CLOCK_SKEW_MARGIN_US,
@@ -57,6 +65,8 @@ def build_service_provider(
     fake,
     api_key="",
     monotonic_ns=time.monotonic_ns,
+    safety_wall_clock=None,
+    safety_monotonic_clock=None,
     popen=subprocess.Popen,
     stop=None,
     on_worker_start=None,
@@ -104,6 +114,8 @@ def build_service_provider(
             api_key=api_key,
             fake=fake,
             monotonic_ns=monotonic_ns,
+            safety_wall_clock=safety_wall_clock,
+            safety_monotonic_clock=safety_monotonic_clock,
             popen=popen,
             stop=stop,
             on_worker_start=on_worker_start,
@@ -131,6 +143,8 @@ def supervise(
     api_key="",
     fake=None,
     monotonic_ns=time.monotonic_ns,
+    safety_wall_clock=None,
+    safety_monotonic_clock=None,
     popen=subprocess.Popen,
     stop=None,
     on_worker_start=None,
@@ -144,6 +158,8 @@ def supervise(
 ):
     """Run at most one worker. A missed cutoff never starts one."""
 
+    if not _clock_dispatch_allowed(safety_wall_clock, safety_monotonic_clock):
+        return SupervisionResult("definite_non_send", calls=0)
     allowance = _budget(claimed_at, wall_clock)
     if allowance is None:
         return _uncertain()
@@ -243,6 +259,16 @@ def supervise(
         _close_control(control)
         if proc is not None:
             _close_pipes(proc)
+
+
+def _clock_dispatch_allowed(wall_clock, monotonic_clock):
+    """Accept dispatch only when the existing probe accepts both clocks."""
+
+    if wall_clock is None:
+        wall_clock = UtcMicrosecondClock()
+    if monotonic_clock is None:
+        monotonic_clock = MonotonicNanosecondClock()
+    return type(sample_clock_safety(wall_clock, monotonic_clock)) is ClockSampleAccepted
 
 
 def _budget(claimed_at, wall_clock):
