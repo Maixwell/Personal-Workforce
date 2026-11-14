@@ -1,5 +1,6 @@
 """Disposable tests for the supervised provider deadline."""
 
+import errno
 import json
 import os
 import shutil
@@ -14,7 +15,8 @@ import time
 import unittest
 import uuid
 import warnings
-from contextlib import contextmanager
+from unittest import mock
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 
@@ -1604,6 +1606,409 @@ def _payload(testcase, result):
         result.stdout + "\n" + result.stderr,
     )
     return json.loads(result.stdout)
+
+
+class _WaitInfo:
+    def __init__(self, si_pid):
+        self.si_pid = si_pid
+
+
+class _OwnedLeader:
+    def __init__(self, pid, *, returncode=None, wait_error=None):
+        self.pid = pid
+        self.returncode = returncode
+        self.stdout = None
+        self.wait_error = wait_error
+        self.events = []
+
+    def wait(self, timeout=None):
+        self.events.append(("wait", timeout))
+        if self.wait_error is not None:
+            raise self.wait_error
+        if self.returncode is None:
+            self.returncode = -signal.SIGKILL
+        return self.returncode
+
+
+class ExitObservationTests(unittest.TestCase):
+    def test_observation_bound_is_shorter_than_the_final_reap(self):
+        observation_ns = provider_supervisor._EXIT_OBSERVATION_NS
+        final_ns = provider_supervisor._FINAL_REAP_TIMEOUT_S * 1_000_000_000
+        self.assertGreater(observation_ns, 0)
+        self.assertLess(observation_ns * 4, final_ns)
+        self.assertLessEqual(
+            provider_supervisor._EXIT_OBSERVATION_SLICE_S,
+            0.05,
+        )
+
+    def test_missing_status_then_observable_exit_signals_before_reap(self):
+        leader, member = _observation_ids()
+        process = _OwnedLeader(leader)
+        exited = _WaitInfo(leader)
+        waits = _scripted_wait(leader, [None, None, None, exited], exited)
+        with _observation_patches(
+            waits,
+            getpgid=_member_group(leader, member),
+            members=(member,),
+            events=process.events,
+            sleep=_noop_sleep,
+        ):
+            stopped = _stop(process, None)
+        self.assertTrue(stopped)
+        self.assertEqual(process.returncode, -signal.SIGKILL)
+        self.assertEqual(
+            [kind for kind, *_rest in process.events],
+            ["sleep", "killpg", "wait"],
+        )
+        self.assertEqual(process.events[1], ("killpg", leader, signal.SIGKILL))
+        self.assertEqual(process.events[2][1], provider_supervisor._FINAL_REAP_TIMEOUT_S)
+        self.assertEqual(waits.options, {os.WEXITED | os.WNOHANG | os.WNOWAIT})
+
+    def test_immediately_observable_exit_does_not_poll(self):
+        leader, member = _observation_ids()
+        process = _OwnedLeader(leader)
+        exited = _WaitInfo(leader)
+        waits = _scripted_wait(leader, [exited], exited)
+
+        def getpgid(pid):
+            if pid == leader:
+                raise AssertionError("live getpgid used for an exited leader")
+            if pid == member:
+                return leader
+            raise ProcessLookupError(errno.ESRCH, "No such process")
+
+        with _observation_patches(
+            waits,
+            getpgid=getpgid,
+            members=(member,),
+            events=process.events,
+            sleep=_forbidden_sleep,
+        ):
+            stopped = _stop(process, None)
+        self.assertTrue(stopped)
+        self.assertEqual(
+            [kind for kind, *_rest in process.events],
+            ["killpg", "wait"],
+        )
+
+    def test_live_proven_group_is_signaled_without_polling(self):
+        leader, _member = _observation_ids()
+        process = _OwnedLeader(leader)
+        waits = _scripted_wait(leader, [None], None)
+        with _observation_patches(
+            waits,
+            getpgid=lambda pid: leader if pid == leader else None,
+            members=(),
+            events=process.events,
+            sleep=_forbidden_sleep,
+        ):
+            stopped = _stop(process, None)
+        self.assertTrue(stopped)
+        self.assertEqual(process.events[0], ("killpg", leader, signal.SIGKILL))
+        self.assertEqual(process.events[1][0], "wait")
+
+    def test_observation_deadline_does_not_signal_or_claim_success(self):
+        leader, _member = _observation_ids()
+        process = _OwnedLeader(leader)
+        clock = _ScriptedClock()
+        waits = _scripted_wait(leader, [None], None)
+        with _observation_patches(
+            waits,
+            getpgid=_esrch,
+            members=(),
+            events=process.events,
+            sleep=clock.sleep,
+            monotonic_ns=clock.monotonic_ns,
+        ):
+            stopped = _stop(process, None)
+        self.assertFalse(stopped)
+        self.assertIsNotNone(process.returncode)
+        self.assertNotIn("killpg", [kind for kind, *_rest in process.events])
+        self.assertEqual(process.events[-1][0], "wait")
+        self.assertGreater(len(clock.sleeps), 0)
+        self.assertTrue(all(
+            delay <= provider_supervisor._EXIT_OBSERVATION_SLICE_S
+            for delay in clock.sleeps
+        ))
+        self.assertLess(
+            sum(clock.sleeps),
+            provider_supervisor._FINAL_REAP_TIMEOUT_S,
+        )
+
+    def test_unproven_wait_results_do_not_poll_or_signal(self):
+        leader, _member = _observation_ids()
+        cases = (
+            ChildProcessError(errno.ECHILD, "No child processes"),
+            _WaitInfo(leader + 100),
+        )
+        for result in cases:
+            with self.subTest(result=type(result).__name__):
+                process = _OwnedLeader(leader)
+                waits = _scripted_wait(leader, [result], result)
+                with _observation_patches(
+                    waits,
+                    getpgid=_unexpected_getpgid,
+                    members=(),
+                    events=process.events,
+                    sleep=_forbidden_sleep,
+                ):
+                    stopped = _stop(process, None)
+                self.assertFalse(stopped)
+                self.assertEqual(
+                    [kind for kind, *_rest in process.events],
+                    ["wait"],
+                )
+
+    def test_already_reaped_worker_is_not_signaled(self):
+        leader, _member = _observation_ids()
+        process = _OwnedLeader(leader, returncode=0)
+        waits = _scripted_wait(leader, [], None)
+        with _observation_patches(
+            waits,
+            getpgid=_unexpected_getpgid,
+            members=(),
+            events=process.events,
+            sleep=_forbidden_sleep,
+        ):
+            stopped = _stop(process, None)
+        self.assertFalse(stopped)
+        self.assertEqual(process.events, [])
+        self.assertEqual(waits.calls, [])
+
+    def test_vanished_and_mismatched_groups_are_not_signaled(self):
+        leader, member = _observation_ids()
+        vanished = _OwnedLeader(leader)
+        waits = _scripted_wait(leader, [_WaitInfo(leader)], _WaitInfo(leader))
+        with _observation_patches(
+            waits,
+            getpgid=_unexpected_getpgid,
+            members=(),
+            events=vanished.events,
+            sleep=_forbidden_sleep,
+        ):
+            self.assertFalse(_stop(vanished, None))
+        self.assertEqual([kind for kind, *_rest in vanished.events], ["wait"])
+        mismatched = _OwnedLeader(leader)
+        waits = _scripted_wait(leader, [None], None)
+        with _observation_patches(
+            waits,
+            getpgid=lambda _pid: leader + 7,
+            members=(member,),
+            events=mismatched.events,
+            sleep=_forbidden_sleep,
+        ):
+            self.assertFalse(_stop(mismatched, None))
+        self.assertEqual([kind for kind, *_rest in mismatched.events], ["wait"])
+
+    def test_permission_and_invalid_groups_do_not_poll(self):
+        leader, _member = _observation_ids()
+        denied = _OwnedLeader(
+            leader,
+            wait_error=subprocess.TimeoutExpired(cmd="worker", timeout=2),
+        )
+        waits = _scripted_wait(leader, [None], None)
+
+        def deny(_group, _sig):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+        with _observation_patches(
+            waits,
+            getpgid=lambda pid: leader if pid == leader else None,
+            members=(),
+            events=denied.events,
+            killpg=deny,
+            sleep=_forbidden_sleep,
+        ):
+            stopped = _stop(denied, None)
+        self.assertFalse(stopped)
+        self.assertIsNone(denied.returncode)
+        self.assertEqual(denied.events[0], ("killpg", leader, signal.SIGKILL))
+        self.assertEqual(denied.events[1][0], "wait")
+        refused = _OwnedLeader(leader)
+        waits = _scripted_wait(leader, [None], None)
+        with _observation_patches(
+            waits,
+            getpgid=_permission_denied,
+            members=(),
+            events=refused.events,
+            sleep=_forbidden_sleep,
+        ):
+            self.assertFalse(_stop(refused, None))
+        self.assertEqual([kind for kind, *_rest in refused.events], ["wait"])
+        for group in (0, -1, os.getpgrp()):
+            with self.subTest(group=group):
+                process = _OwnedLeader(leader)
+                waits = _scripted_wait(leader, [None], None)
+                with _observation_patches(
+                    waits,
+                    getpgid=lambda _pid, group=group: group,
+                    members=(),
+                    events=process.events,
+                    sleep=_forbidden_sleep,
+                ):
+                    self.assertFalse(_stop(process, None))
+                self.assertEqual(
+                    [kind for kind, *_rest in process.events],
+                    ["wait"],
+                )
+
+    def test_failed_proof_or_signal_does_not_claim_success(self):
+        leader, member = _observation_ids()
+        unproven = _OwnedLeader(leader)
+        waits = _scripted_wait(leader, [None, None, _WaitInfo(leader)], _WaitInfo(leader))
+        clock = _ScriptedClock()
+        with _observation_patches(
+            waits,
+            getpgid=_esrch,
+            members=(),
+            events=unproven.events,
+            sleep=clock.sleep,
+            monotonic_ns=clock.monotonic_ns,
+        ):
+            self.assertFalse(_stop(unproven, None))
+        self.assertNotIn("killpg", [kind for kind, *_rest in unproven.events])
+        failed = _OwnedLeader(leader)
+        waits = _scripted_wait(leader, [_WaitInfo(leader)], _WaitInfo(leader))
+
+        def fail_signal(_group, _sig):
+            raise OSError(errno.ESRCH, "No such process")
+
+        with _observation_patches(
+            waits,
+            getpgid=_member_group(leader, member),
+            members=(member,),
+            events=failed.events,
+            killpg=fail_signal,
+            sleep=_forbidden_sleep,
+        ):
+            self.assertFalse(_stop(failed, None))
+        self.assertEqual(failed.events[0][0], "killpg")
+        self.assertEqual(failed.events[1][0], "wait")
+        self.assertIsNotNone(failed.returncode)
+
+
+class _ScriptedWait:
+    def __init__(self, pid, script, tail):
+        self.pid = pid
+        self.script = list(script)
+        self.tail = tail
+        self.calls = []
+        self.options = set()
+
+    def __call__(self, idtype, pid, options):
+        self.calls.append((idtype, pid, options))
+        self.options.add(options)
+        if idtype != os.P_PID or pid != self.pid:
+            raise AssertionError(f"unexpected wait target {idtype} {pid}")
+        if options != os.WEXITED | os.WNOHANG | os.WNOWAIT:
+            raise AssertionError(f"unexpected wait options {options}")
+        item = self.script.pop(0) if self.script else self.tail
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class _ScriptedClock:
+    def __init__(self):
+        self.now = 1_000_000_000_000
+        self.sleeps = []
+
+    def monotonic_ns(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += int(seconds * 1_000_000_000)
+
+
+def _observation_ids():
+    leader = 424242
+    member = 424243
+    reserved = {os.getpid(), os.getpgrp()}
+    while leader in reserved or member in reserved:
+        leader += 10
+        member += 10
+    return leader, member
+
+
+def _scripted_wait(pid, script, tail):
+    return _ScriptedWait(pid, script, tail)
+
+
+def _member_group(leader, member):
+    def getpgid(pid):
+        if pid == member:
+            return leader
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    return getpgid
+
+
+def _unexpected_getpgid(_pid):
+    raise AssertionError("getpgid was not part of this observation")
+
+
+def _esrch(_pid):
+    raise ProcessLookupError(errno.ESRCH, "No such process")
+
+
+def _permission_denied(_pid):
+    raise PermissionError(errno.EPERM, "Operation not permitted")
+
+
+def _forbidden_sleep(seconds):
+    raise AssertionError(f"exit observation slept for {seconds}")
+
+
+def _noop_sleep(_seconds):
+    return None
+
+
+def _observation_patches(
+    waits,
+    *,
+    getpgid,
+    members,
+    events,
+    sleep=_forbidden_sleep,
+    monotonic_ns=None,
+    killpg=None,
+):
+    def recorded_killpg(group, sig):
+        events.append(("killpg", group, sig))
+        if group == os.getpgrp() or group <= 0 or group == os.getpid():
+            raise AssertionError(f"refusing signal for group {group}")
+        if killpg is not None:
+            return killpg(group, sig)
+        return None
+
+    def recorded_sleep(seconds):
+        events.append(("sleep", seconds))
+        return sleep(seconds)
+
+    if monotonic_ns is None:
+        monotonic_ns = time.monotonic_ns
+    stack = ExitStack()
+    stack.enter_context(mock.patch.object(provider_supervisor.os, "waitid", waits))
+    stack.enter_context(mock.patch.object(provider_supervisor.os, "getpgid", getpgid))
+    stack.enter_context(mock.patch.object(provider_supervisor.os, "killpg", recorded_killpg))
+    stack.enter_context(mock.patch.object(
+        provider_supervisor.os,
+        "kill",
+        lambda *_args: None,
+    ))
+    stack.enter_context(mock.patch.object(
+        provider_supervisor,
+        "_process_ids",
+        lambda: members,
+    ))
+    stack.enter_context(mock.patch.object(provider_supervisor.time, "sleep", recorded_sleep))
+    stack.enter_context(mock.patch.object(
+        provider_supervisor.time,
+        "monotonic_ns",
+        monotonic_ns,
+    ))
+    return stack
 
 
 if __name__ == "__main__":

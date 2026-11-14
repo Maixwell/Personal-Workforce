@@ -9,6 +9,7 @@ not change that allowance.
 """
 
 import ctypes
+import errno
 import json
 import os
 import select
@@ -36,6 +37,9 @@ from max_smart_db.config import (
 
 _ALLOWANCE_US = EXECUTION_DEADLINE_US - RECOVERY_CLOCK_SKEW_MARGIN_US
 _MAX_FRAME_BYTES = 1_000_000
+_FINAL_REAP_TIMEOUT_S = 2
+_EXIT_OBSERVATION_NS = 200_000_000
+_EXIT_OBSERVATION_SLICE_S = 0.01
 _MODEL = "gpt-5.6-sol"
 
 
@@ -369,16 +373,9 @@ def _reap_after_group_signal(proc):
     if proc.returncode is not None:
         _close_pipes(proc)
         return False
-    state = _direct_child_state(proc.pid)
-    signaled = False
-    if state == "alive":
-        signaled = _signal_owned_worker_group(proc.pid)
-        if not signaled and _direct_child_state(proc.pid) == "exited":
-            signaled = _signal_exited_leader_group(proc.pid)
-    elif state == "exited":
-        signaled = _signal_exited_leader_group(proc.pid)
+    signaled = _signal_before_reap(proc.pid)
     try:
-        proc.wait(timeout=2)
+        proc.wait(timeout=_FINAL_REAP_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return False
     except OSError:
@@ -387,17 +384,57 @@ def _reap_after_group_signal(proc):
     return signaled and proc.returncode is not None
 
 
-def _signal_owned_worker_group(pid):
-    """SIGKILL a live worker session, or False when that group is not proven."""
+def _signal_before_reap(pid):
+    """Signal only a proven group. An unreaped ESRCH leader is observed first."""
 
     if type(pid) is not int or pid <= 0 or pid == os.getpid():
         return False
-    if _direct_child_state(pid) != "alive":
+    state = _direct_child_state(pid)
+    if state == "exited":
+        return _signal_exited_leader_group(pid)
+    if state != "alive":
         return False
+    kind, group = _classify_live_group(pid)
+    if kind == "exited":
+        return _signal_exited_leader_group(pid)
+    if kind == "proven":
+        signaled = _kill_owned_group(pid, group)
+        if signaled or _direct_child_state(pid) != "exited":
+            return signaled
+        return _signal_exited_leader_group(pid)
+    if kind == "esrch":
+        return _signal_after_exit_becomes_observable(pid)
+    return False
+
+
+def _classify_live_group(pid):
+    """Return the live-group result without signaling or reaping.
+
+    esrch is the only result that may start exit observation. Permission
+    errors, mismatched groups, and every other failure stay refused.
+    """
+
+    if type(pid) is not int or pid <= 0 or pid == os.getpid():
+        return "refused", None
+    state = _direct_child_state(pid)
+    if state == "exited":
+        return "exited", None
+    if state != "alive":
+        return "refused", None
     try:
         group = os.getpgid(pid)
-    except OSError:
-        return False
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return "esrch", None
+        return "refused", None
+    if not _owned_group(pid, group):
+        return "refused", None
+    return "proven", group
+
+
+def _kill_owned_group(pid, group):
+    """SIGKILL one group that has just been proven for this unreaped leader."""
+
     if not _owned_group(pid, group):
         return False
     try:
@@ -405,6 +442,30 @@ def _signal_owned_worker_group(pid):
     except OSError:
         return False
     return True
+
+
+def _signal_after_exit_becomes_observable(pid):
+    """Wait briefly for waitid to publish an exit, without reaping.
+
+    A missing wait status is not proof that the leader is alive. The deadline
+    is fixed before the loop and is much shorter than the final reap wait.
+    Expiry or an unproven sample does not signal.
+    """
+
+    deadline = time.monotonic_ns() + _EXIT_OBSERVATION_NS
+    while True:
+        state = _direct_child_state(pid)
+        if state == "exited":
+            return _signal_exited_leader_group(pid)
+        if state != "alive":
+            return False
+        now = time.monotonic_ns()
+        if now >= deadline:
+            return False
+        remaining = (deadline - now) / 1_000_000_000
+        if remaining <= 0:
+            return False
+        time.sleep(min(_EXIT_OBSERVATION_SLICE_S, remaining))
 
 
 def _signal_exited_leader_group(pid):
@@ -443,7 +504,11 @@ def _owned_group(pid, group):
 
 
 def _direct_child_state(pid):
-    """Return alive, exited, or unproven. This wait does not reap the child."""
+    """Return alive, exited, or unproven. This wait does not reap the child.
+
+    alive means this nonblocking wait has no exit status yet. It does not by
+    itself prove that the process is still running.
+    """
 
     if type(pid) is not int or pid <= 0 or pid == os.getpid():
         return "unproven"
