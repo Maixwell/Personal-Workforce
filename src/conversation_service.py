@@ -15,6 +15,7 @@ from max_smart_db.fingerprint import (
 from max_smart_db.repository import (
     Adopted,
     AlreadyOwned,
+    AcknowledgedDiscard,
     AlreadySucceeded,
     Applied,
     Claimed,
@@ -686,6 +687,8 @@ class ConversationService:
                 apply_retries=0,
                 allow_reconcile=False,
             )
+        if type(result) is AcknowledgedDiscard:
+            self._retained.pop(_identity(claimed), None)
         return result
 
     def _success_if_observed(self, claimed, completion):

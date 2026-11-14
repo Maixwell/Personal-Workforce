@@ -448,6 +448,7 @@ class ConversationOutcomeTests(unittest.TestCase):
             print(json.dumps({
                 "type": type(outcome).__name__,
                 "assistant": outcome.assistant_message.content,
+                "retained_values": list(handler._retained.values()),
                 "provider": box["provider"],
                 "apply_writes": box["apply"],
                 "reconcile": box["reconcile"],
@@ -464,6 +465,7 @@ class ConversationOutcomeTests(unittest.TestCase):
         payload = _payload(self, result)
         self.assertEqual(payload["type"], "DurableTurnCompleted")
         self.assertEqual(payload["assistant"], "kept answer")
+        self.assertEqual(payload["retained_values"], [])
         self.assertEqual(payload["provider"], 1)
         self.assertEqual(payload["apply_writes"], 1)
         self.assertEqual(payload["reconcile"], 1)
@@ -561,6 +563,7 @@ class ConversationOutcomeTests(unittest.TestCase):
             print(json.dumps({
                 "type": type(outcome).__name__,
                 "retained": outcome.retained_output,
+                "stored": list(handler._retained.values()),
                 "provider": box["provider"],
                 "apply_writes": box["apply"],
                 "failure_writes": box["failure"],
@@ -572,6 +575,7 @@ class ConversationOutcomeTests(unittest.TestCase):
         payload = _payload(self, result)
         self.assertEqual(payload["type"], "OutcomeUnconfirmed")
         self.assertEqual(payload["retained"], "kept answer")
+        self.assertEqual(payload["stored"], ["kept answer"])
         self.assertEqual(payload["provider"], 1)
         self.assertEqual(payload["apply_writes"], 1)
         self.assertEqual(payload["failure_writes"], 0)
@@ -595,6 +599,7 @@ class ConversationOutcomeTests(unittest.TestCase):
             print(json.dumps({
                 "type": type(outcome).__name__,
                 "retained": getattr(outcome, "retained_output", None),
+                "stored": list(handler._retained.values()),
                 "provider": box["provider"],
                 "reconcile": box["reconcile"],
                 "facts": facts(shown(outcome)),
@@ -604,11 +609,145 @@ class ConversationOutcomeTests(unittest.TestCase):
         payload = _payload(self, result)
         self.assertEqual(payload["type"], "OutcomeUnconfirmed")
         self.assertEqual(payload["retained"], "kept answer")
+        self.assertEqual(payload["stored"], ["kept answer"])
         self.assertEqual(payload["provider"], 1)
         self.assertEqual(payload["reconcile"], 0)
         self.assertEqual(payload["facts"]["status"], "OUTCOME_UNKNOWN")
         self.assertEqual(payload["facts"]["messages"], 0)
         self.assertEqual(payload["facts"]["version"], 0)
+
+    def test_acknowledged_discard_removes_only_the_matching_retained_output(self):
+        result = _run(
+            """\
+            def provide(box, **kwargs):
+                operation_id = GlobalModelSlot.objects.get(pk=1).operation_id
+                SqliteConversationRepository(Clock(LEASE), RUNNER).recover_slot()
+                box["operation_id"] = operation_id
+                return "kept answer"
+
+            handler, box = service(provide)
+            real_reconcile = handler._repository.reconcile_late_success
+            planted = {}
+
+            def acknowledge_then_reconcile(retained):
+                claimed = retained.claimed_operation
+                identity = (
+                    claimed.operation_id,
+                    claimed.runner_id,
+                    claimed.claimed_at,
+                )
+                planted["before"] = handler._retained.get(identity)
+                planted["output"] = retained.output_text
+                other_claim = (claimed.operation_id, STALE, claimed.claimed_at)
+                other_operation = (uuid.uuid4(), claimed.runner_id, claimed.claimed_at)
+                handler._retained[other_claim] = "other claim"
+                handler._retained[other_operation] = "other operation"
+                planted["other_claim"] = [
+                    str(other_claim[0]),
+                    other_claim[1],
+                    other_claim[2],
+                ]
+                planted["other_operation"] = [
+                    str(other_operation[0]),
+                    other_operation[1],
+                    other_operation[2],
+                ]
+                SqliteConversationRepository(Clock(LEASE), RUNNER).acknowledge_unknown(
+                    OWNER.id,
+                    claimed.operation_id,
+                )
+                return real_reconcile(retained)
+
+            handler._repository.reconcile_late_success = acknowledge_then_reconcile
+            outcome = handler.submit(request())
+            second = handler.submit(request())
+            operation = Operation.objects.get(owner_id=OWNER.id)
+            print(json.dumps({
+                "type": type(outcome).__name__,
+                "second": type(second).__name__,
+                "before": planted["before"],
+                "output": planted["output"],
+                "provider": box["provider"],
+                "reconcile": box["reconcile"],
+                "messages": [
+                    [row.role, row.content]
+                    for row in Message.objects.order_by("sequence")
+                ],
+                "status": operation.status,
+                "acknowledged": operation.acknowledged_at_us is not None,
+                "blocks": operation.blocks_conversation,
+                "version": Conversation.objects.get(pk=CONVERSATION).version,
+                "retained": [
+                    [str(operation_id), runner, claimed_at, text]
+                    for (operation_id, runner, claimed_at), text in handler._retained.items()
+                ],
+                "other_claim": planted["other_claim"],
+                "other_operation": planted["other_operation"],
+            }))
+            """
+        )
+        payload = _payload(self, result)
+        self.assertEqual(payload["type"], "AcknowledgedDiscard")
+        self.assertEqual(payload["second"], "Existing")
+        self.assertEqual(payload["before"], "kept answer")
+        self.assertEqual(payload["output"], "kept answer")
+        self.assertEqual(payload["provider"], 1)
+        self.assertEqual(payload["reconcile"], 1)
+        self.assertEqual(payload["messages"], [])
+        self.assertEqual(payload["status"], "OUTCOME_UNKNOWN")
+        self.assertTrue(payload["acknowledged"])
+        self.assertEqual(payload["blocks"], 0)
+        self.assertEqual(payload["version"], 0)
+        self.assertEqual(
+            payload["retained"],
+            [
+                payload["other_claim"] + ["other claim"],
+                payload["other_operation"] + ["other operation"],
+            ],
+        )
+
+    def test_ambiguous_apply_preserves_retained_output(self):
+        result = _run(
+            """\
+            def provide(box, **kwargs):
+                return "kept answer"
+
+            handler, box = service(provide)
+
+            def ambiguous(claimed, output_text):
+                return CommitAmbiguous(
+                    operation_id=claimed.operation_id,
+                    runner_id=claimed.runner_id,
+                    claimed_at=claimed.claimed_at,
+                    conversation_id=claimed.conversation_id,
+                )
+
+            handler._repository.apply_success = ambiguous
+            other = (uuid.uuid4(), RUNNER, 1)
+            handler._retained[other] = "other operation"
+            outcome = handler.submit(request())
+            identity = (outcome.operation_id, outcome.runner_id, outcome.claimed_at)
+            print(json.dumps({
+                "type": type(outcome).__name__,
+                "retained": outcome.retained_output,
+                "stored": handler._retained.get(identity),
+                "other": handler._retained.get(other),
+                "provider": box["provider"],
+                "reconcile": box["reconcile"],
+                "messages": Message.objects.count(),
+                "status": Operation.objects.get(pk=outcome.operation_id).status,
+            }))
+            """
+        )
+        payload = _payload(self, result)
+        self.assertEqual(payload["type"], "OutcomeUnconfirmed")
+        self.assertEqual(payload["retained"], "kept answer")
+        self.assertEqual(payload["stored"], "kept answer")
+        self.assertEqual(payload["other"], "other operation")
+        self.assertEqual(payload["provider"], 1)
+        self.assertEqual(payload["reconcile"], 0)
+        self.assertEqual(payload["messages"], 0)
+        self.assertEqual(payload["status"], "RUNNING")
 
     def test_persistence_failure_retains_output_without_replay(self):
         result = _run(
@@ -632,6 +771,7 @@ class ConversationOutcomeTests(unittest.TestCase):
             print(json.dumps({
                 "type": type(outcome).__name__,
                 "retained": outcome.retained_output,
+                "stored": list(handler._retained.values()),
                 "provider": box["provider"],
                 "second_type": type(second).__name__,
                 "second_provider": again_box["provider"],
@@ -642,6 +782,7 @@ class ConversationOutcomeTests(unittest.TestCase):
         payload = _payload(self, result)
         self.assertEqual(payload["type"], "OutcomeUnconfirmed")
         self.assertEqual(payload["retained"], "kept answer")
+        self.assertEqual(payload["stored"], ["kept answer"])
         self.assertEqual(payload["provider"], 1)
         self.assertEqual(payload["second_type"], "Existing")
         self.assertEqual(payload["second_provider"], 0)
