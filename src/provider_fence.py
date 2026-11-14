@@ -31,6 +31,21 @@ Operational contract:
   is not stored in the record. File mode 0600 does not stop the owning
   user from replacing the record, so a process that is given a new pin can
   be pointed at a substituted record.
+- A disposable pin file stores that captured pin outside the fence directory.
+  Loading reads the pin file and then the trust record. It does not derive
+  a pin from the live fence or the live record. Mode 0600 does not stop the
+  owning user from replacing the pin file, so a fully replaced pin, record,
+  and fence is another chain.
+- A pin is successfully provisioned only after its full write, file fsync,
+  parent fsync, and descriptor closure all succeed. A failed pin is revoked
+  in place by truncating that same descriptor to zero bytes. Truncation
+  keeps the directory entry and inode. If that revocation cannot be
+  verified, provisioning reports pin_completion_uncertain and does not
+  reconstruct a pin. An empty or partial result is incomplete. Rereading
+  canonical bytes does not prove that fsync succeeded. A concurrent reader
+  or a process interruption can still observe an ambiguous chain. That
+  residual is not production-readiness evidence. fence_record_and_pin names
+  the surviving files; it does not mean provisioning completed.
 """
 
 import ctypes
@@ -42,6 +57,7 @@ import json
 import os
 import re
 import stat
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +71,12 @@ _TRUST_VERSION = "max-smart-provider-fence-trust-v1"
 _TRUST_RECORD_NAME = "fence.trust"
 _FENCE_FILE_NAME = "provider.fence"
 _TRUST_RECORD_MAX_BYTES = 8192
+_PIN_VERSION = "max-smart-provider-fence-pin-v1"
+_PIN_FILE_NAME = "provider-fence.pin"
+_PIN_MAX_BYTES = 8192
+_APPROVED_PIN_DIRECTORY = Path(
+    "/Users/smart/Library/Application Support/MaxSmartTrust"
+)
 _ENV_PATH = "MAX_SMART_PROVIDER_FENCE"
 _ENV_DEVICE = "MAX_SMART_PROVIDER_FENCE_DEVICE"
 _ENV_INODE = "MAX_SMART_PROVIDER_FENCE_INODE"
@@ -107,11 +129,12 @@ class DisposableFenceTrust:
 
 
 class FenceSafetyError(RuntimeError):
-    """A disposable fence could not be prepared. The file was not replaced."""
+    """A fence trust operation failed closed. Existing files were not replaced."""
 
-    def __init__(self, code):
+    def __init__(self, code, partial=None):
         super().__init__(code)
         self.code = code
+        self.partial = partial
 
 
 class FenceBusy:
@@ -400,6 +423,86 @@ def fence_config_from_trust(pin, explicit=None):
     """Load a pinned record and refuse a different explicit fence identity."""
 
     config = load_disposable_fence_trust(pin)
+    if explicit is not None and not _same_config(explicit, config):
+        raise FenceSafetyError("fence_identity_changed")
+    return config
+
+
+@dataclass(frozen=True)
+class DisposableFencePin:
+    """One fence, its original trust pin, and the separate pin file."""
+
+    fence: ProviderFenceConfig
+    pin: TrustRecordPin
+    pin_path: str
+
+
+def provision_disposable_fence_pin(fence_directory, pin_directory):
+    """Create a fence, trust record, and original pin file.
+
+    Both directories must already be separate private local directories.
+    This function does not create or chmod them, does not publish an
+    identity, and does not delete or replace a file. A failure after the
+    fence exists leaves that partial chain in place. The partial value names
+    surviving files and does not mean the pin was successfully provisioned.
+    """
+
+    fence_root = _disposable_directory(fence_directory)
+    pin_root = _disposable_directory(pin_directory)
+    if _directories_overlap(fence_root, pin_root):
+        raise FenceSafetyError("pin_directory_invalid")
+    pin_path = pin_root / _PIN_FILE_NAME
+    fence_identity = _inspect_private_directory(
+        fence_root,
+        (
+            (_TRUST_RECORD_NAME, "trust_record_symlink", "trust_record_exists"),
+            (_FENCE_FILE_NAME, "fence_symlink", "fence_exists"),
+        ),
+    )
+    pin_identity = _inspect_private_directory(
+        pin_root,
+        ((_PIN_FILE_NAME, "pin_file_symlink", "pin_file_exists"),),
+    )
+    if fence_identity == pin_identity:
+        raise FenceSafetyError("pin_directory_invalid")
+    try:
+        trust = provision_disposable_fence_trust(str(fence_root))
+    except FenceSafetyError as error:
+        _reraise_partial(error, fence_root, pin_path)
+    payload = _pin_bytes(trust.pin)
+    try:
+        _create_pin_file(pin_path, payload)
+    except FenceSafetyError as error:
+        _reraise_partial(error, fence_root, pin_path)
+    return DisposableFencePin(trust.fence, trust.pin, str(pin_path))
+
+
+def load_disposable_fence_pin(path):
+    """Return the fence named by a pin file.
+
+    The pin comes from the file bytes. The live fence inode is not copied
+    into it, and this function does not create or rewrite any file.
+    """
+
+    pin = _read_pin_file(path)
+    return load_disposable_fence_trust(pin)
+
+
+def publish_loaded_fence_pin(path):
+    """Publish the fence named by a pin file, once.
+
+    A conflicting identity that is already published is left unchanged.
+    """
+
+    config = load_disposable_fence_pin(path)
+    publish_shared_fence_config(config)
+    return config
+
+
+def fence_config_from_pin(path, explicit=None):
+    """Load a pin file and refuse a different explicit fence identity."""
+
+    config = load_disposable_fence_pin(path)
     if explicit is not None and not _same_config(explicit, config):
         raise FenceSafetyError("fence_identity_changed")
     return config
@@ -801,6 +904,380 @@ def _valid_pin(pin):
     ):
         return False
     return all(character in "0123456789abcdef" for character in pin.digest)
+
+
+def _refuse_approved_pin(path):
+    if path == _APPROVED_PIN_DIRECTORY or _APPROVED_PIN_DIRECTORY in path.parents:
+        raise FenceSafetyError("production_fence_refused")
+
+
+def _disposable_directory(directory):
+    root = _absolute_path(directory)
+    if root is None or root.name == "":
+        raise FenceSafetyError("fence_path_invalid")
+    _refuse_approved_pin(root)
+    if _under_production_data(root):
+        raise FenceSafetyError("production_fence_refused")
+    if _cloud_path(root):
+        raise FenceSafetyError("fence_path_refused")
+    return root
+
+
+def _directories_overlap(left, right):
+    return left == right or left in right.parents or right in left.parents
+
+
+def _inspect_private_directory(root, names):
+    parent_fd, _name = _open_parent(root / names[0][0])
+    try:
+        if not _directory_is_local(parent_fd):
+            raise FenceSafetyError("fence_filesystem")
+        status = os.fstat(parent_fd)
+        for name, symlink_code, exists_code in names:
+            _refuse_existing_name(parent_fd, name, symlink_code, exists_code)
+        return status.st_dev, status.st_ino
+    finally:
+        _close_all_preserving(((parent_fd, "pin parent"),))
+
+
+def _refuse_existing_name(parent_fd, name, symlink_code, exists_code):
+    status = _named_status(parent_fd, name)
+    if status is None:
+        return
+    if stat.S_ISLNK(status.st_mode):
+        raise FenceSafetyError(symlink_code)
+    raise FenceSafetyError(exists_code)
+
+
+def _chain_partial(fence_root, pin_path):
+    fence_exists = _path_exists(fence_root / _FENCE_FILE_NAME)
+    record_exists = _path_exists(fence_root / _TRUST_RECORD_NAME)
+    pin_exists = _path_exists(pin_path)
+    if fence_exists and record_exists and pin_exists:
+        return "fence_record_and_pin"
+    if fence_exists and record_exists:
+        return "fence_and_record"
+    if fence_exists:
+        return "fence_only"
+    return None
+
+
+def _path_exists(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise FenceSafetyError("fence_unreadable") from error
+    return True
+
+
+def _reraise_partial(error, fence_root, pin_path):
+    try:
+        partial = _chain_partial(fence_root, pin_path)
+    except FenceSafetyError as inspection:
+        error.add_note("partial inspection failed: " + inspection.code)
+        raise error
+    if partial is not None:
+        error.partial = partial
+    raise error
+
+
+def _close_one(descriptor):
+    if descriptor is None:
+        return None
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        return error
+    return None
+
+
+def _annotate_cleanup(primary, cleanup, label):
+    primary.add_note(f"{label} close failed: errno {cleanup.errno}")
+
+
+def _close_all_preserving(pairs):
+    """Close every descriptor. A close error does not replace an active one."""
+
+    failures = []
+    for descriptor, label in pairs:
+        cleanup = _close_one(descriptor)
+        if cleanup is not None:
+            failures.append((label, cleanup))
+    if not failures:
+        return
+    current = sys.exc_info()[1]
+    if current is not None:
+        for label, cleanup in failures:
+            _annotate_cleanup(current, cleanup, label)
+        return
+    raised = FenceSafetyError("pin_descriptor_close_failed")
+    raised.__cause__ = failures[0][1]
+    for label, cleanup in failures:
+        _annotate_cleanup(raised, cleanup, label)
+    raise raised
+
+
+def _pin_open_error(error):
+    if error.errno == errno.ELOOP:
+        code = "pin_file_symlink"
+    elif error.errno == errno.EEXIST:
+        code = "pin_file_exists"
+    else:
+        code = "pin_file_create_failed"
+    raised = FenceSafetyError(code)
+    raised.__cause__ = error
+    return raised
+
+
+def _revoke_pin_descriptor(descriptor, inode):
+    """Truncate the open pin and verify that same inode is empty.
+
+    Verification uses fstat and fsync of this descriptor. It does not reread
+    the file bytes and does not prove anything about a concurrent reader or
+    a process that stops before this call.
+    """
+
+    if descriptor is None or type(inode) is not int:
+        return OSError(errno.EBADF, "pin descriptor unavailable")
+    try:
+        os.ftruncate(descriptor, 0)
+        current = os.fstat(descriptor)
+        if current.st_ino != inode or current.st_size != 0:
+            return OSError(errno.EIO, "pin revocation unverified")
+        os.fsync(descriptor)
+    except OSError as error:
+        return error
+    return None
+
+
+def _revoke_or_uncertain(descriptor, inode, primary):
+    problem = _revoke_pin_descriptor(descriptor, inode)
+    if problem is None:
+        return primary
+    uncertain = FenceSafetyError("pin_completion_uncertain")
+    uncertain.__cause__ = primary
+    uncertain.add_note(
+        "pin revocation unverified: errno %s" % getattr(problem, "errno", "unknown")
+    )
+    return uncertain
+
+
+def _create_pin_file(pin_path, payload):
+    parent_fd, name = _open_parent(pin_path)
+    descriptor = None
+    inode = None
+    primary = None
+    try:
+        try:
+            descriptor = os.open(
+                name,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            primary = _pin_open_error(error)
+        if descriptor is not None and primary is None:
+            try:
+                os.set_inheritable(descriptor, False)
+                inode = os.fstat(descriptor).st_ino
+                written = os.write(descriptor, payload)
+                if written != len(payload):
+                    raise FenceSafetyError("pin_file_create_failed")
+            except FenceSafetyError as error:
+                primary = _revoke_or_uncertain(descriptor, inode, error)
+            except OSError as error:
+                failed = FenceSafetyError("pin_file_create_failed")
+                failed.__cause__ = error
+                primary = _revoke_or_uncertain(descriptor, inode, failed)
+        if descriptor is not None and primary is None:
+            try:
+                os.fsync(descriptor)
+                current = os.fstat(descriptor)
+                if current.st_ino != inode or not _private_regular(current):
+                    raise FenceSafetyError("pin_file_permissions")
+                if not _local_apfs(descriptor, current.st_dev):
+                    raise FenceSafetyError("fence_filesystem")
+                os.fsync(parent_fd)
+            except FenceSafetyError as error:
+                primary = _revoke_or_uncertain(descriptor, inode, error)
+            except OSError as error:
+                failed = FenceSafetyError("pin_file_fsync_failed")
+                failed.__cause__ = error
+                primary = _revoke_or_uncertain(descriptor, inode, failed)
+        if primary is None:
+            parent_error = _close_one(parent_fd)
+            parent_fd = None
+            if parent_error is not None:
+                failed = FenceSafetyError("pin_descriptor_close_failed")
+                failed.__cause__ = parent_error
+                _annotate_cleanup(failed, parent_error, "pin parent")
+                primary = _revoke_or_uncertain(descriptor, inode, failed)
+    finally:
+        file_error = _close_one(descriptor)
+        parent_error = _close_one(parent_fd)
+        if file_error is not None:
+            if primary is None:
+                failed = FenceSafetyError("pin_descriptor_close_failed")
+                failed.__cause__ = file_error
+                _annotate_cleanup(failed, file_error, "pin file")
+                primary = _revoke_or_uncertain(descriptor, inode, failed)
+            else:
+                _annotate_cleanup(primary, file_error, "pin file")
+        if parent_error is not None:
+            if primary is None:
+                failed = FenceSafetyError("pin_descriptor_close_failed")
+                failed.__cause__ = parent_error
+                _annotate_cleanup(failed, parent_error, "pin parent")
+                primary = _revoke_or_uncertain(descriptor, inode, failed)
+            else:
+                _annotate_cleanup(primary, parent_error, "pin parent")
+    if primary is not None:
+        raise primary
+
+
+def _pin_bytes(pin):
+    if not _valid_pin(pin):
+        raise FenceSafetyError("trust_pin_invalid")
+    body = json.dumps(
+        {
+            "device": pin.device,
+            "digest": pin.digest,
+            "inode": pin.inode,
+            "path": pin.path,
+            "version": _PIN_VERSION,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (body + "\n").encode("ascii")
+
+
+def _pin_file_path(path):
+    if type(path) is not str:
+        raise FenceSafetyError("pin_file_invalid")
+    candidate = _absolute_path(path)
+    if (
+        candidate is None
+        or str(candidate) != path
+        or candidate.name != _PIN_FILE_NAME
+    ):
+        raise FenceSafetyError("pin_file_invalid")
+    _refuse_approved_pin(candidate)
+    if _under_production_data(candidate):
+        raise FenceSafetyError("production_fence_refused")
+    if _cloud_path(candidate):
+        raise FenceSafetyError("fence_path_refused")
+    return candidate
+
+
+def _read_pin_file(path):
+    candidate = _pin_file_path(path)
+    parent_fd = None
+    descriptor = None
+    try:
+        parent_fd, name = _open_parent(candidate)
+        listed = _named_status(parent_fd, name)
+        if listed is None:
+            raise FenceSafetyError("pin_file_missing")
+        if stat.S_ISLNK(listed.st_mode):
+            raise FenceSafetyError("pin_file_symlink")
+        if not stat.S_ISREG(listed.st_mode):
+            raise FenceSafetyError("pin_file_malformed")
+        if stat.S_IMODE(listed.st_mode) != 0o600:
+            raise FenceSafetyError("pin_file_permissions")
+        if listed.st_uid != os.geteuid():
+            raise FenceSafetyError("pin_file_owner")
+        if listed.st_nlink != 1:
+            raise FenceSafetyError("pin_file_hard_link")
+        if listed.st_size > _PIN_MAX_BYTES:
+            raise FenceSafetyError("pin_file_malformed")
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise FenceSafetyError("pin_file_symlink") from error
+            raise FenceSafetyError("pin_file_unreadable") from error
+        os.set_inheritable(descriptor, False)
+        current = os.fstat(descriptor)
+        if current.st_dev != listed.st_dev or current.st_ino != listed.st_ino:
+            raise FenceSafetyError("pin_file_identity")
+        if not _private_regular(current):
+            if current.st_uid != os.geteuid():
+                raise FenceSafetyError("pin_file_owner")
+            if current.st_nlink != 1:
+                raise FenceSafetyError("pin_file_hard_link")
+            if stat.S_IMODE(current.st_mode) != 0o600:
+                raise FenceSafetyError("pin_file_permissions")
+            raise FenceSafetyError("pin_file_identity")
+        if not _local_apfs(descriptor, current.st_dev):
+            raise FenceSafetyError("fence_filesystem")
+        payload = os.read(descriptor, _PIN_MAX_BYTES + 1)
+        if len(payload) != current.st_size:
+            raise FenceSafetyError("pin_file_unreadable")
+        return _parse_pin_file(payload)
+    except FenceSafetyError:
+        raise
+    except OSError as error:
+        raise FenceSafetyError("pin_file_unreadable") from error
+    finally:
+        _close_all_preserving(
+            (
+                (descriptor, "pin file"),
+                (parent_fd, "pin parent"),
+            )
+        )
+
+
+def _parse_pin_file(payload):
+    if type(payload) is not bytes or payload == b"" or not payload.endswith(b"\n"):
+        raise FenceSafetyError("pin_file_truncated")
+    if len(payload) > _PIN_MAX_BYTES or payload.count(b"\n") != 1:
+        raise FenceSafetyError("pin_file_malformed")
+    try:
+        parsed = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise FenceSafetyError("pin_file_malformed") from None
+    if (
+        type(parsed) is not dict
+        or set(parsed) != {"device", "digest", "inode", "path", "version"}
+        or parsed["version"] != _PIN_VERSION
+        or type(parsed["path"]) is not str
+        or type(parsed["digest"]) is not str
+        or type(parsed["device"]) is not int
+        or type(parsed["inode"]) is not int
+        or type(parsed["device"]) is bool
+        or type(parsed["inode"]) is bool
+    ):
+        raise FenceSafetyError("pin_file_malformed")
+    pin = TrustRecordPin(
+        parsed["path"],
+        parsed["device"],
+        parsed["inode"],
+        parsed["digest"],
+    )
+    record = _absolute_path(pin.path)
+    if (
+        not _valid_pin(pin)
+        or record is None
+        or str(record) != pin.path
+        or record.name != _TRUST_RECORD_NAME
+        or _pin_bytes(pin) != payload
+    ):
+        raise FenceSafetyError("pin_file_malformed")
+    _refuse_approved_pin(record)
+    if _under_production_data(record):
+        raise FenceSafetyError("production_fence_refused")
+    if _cloud_path(record):
+        raise FenceSafetyError("fence_path_refused")
+    return pin
 
 
 def _read_trust_record(pin):
