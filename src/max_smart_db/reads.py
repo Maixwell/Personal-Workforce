@@ -99,6 +99,12 @@ class SqliteConversationReader:
             runner_id,
         )
 
+    def inspect_acknowledged_unknown(self, actor_id, operation_id):
+        """Prove one committed acknowledgement without writing."""
+        from .acknowledgement_inspection import inspect_acknowledged_unknown
+
+        return inspect_acknowledged_unknown(actor_id, operation_id)
+
     def load_snapshot(self, actor_id, conversation_id):
         """Return one owned snapshot from a single deferred read."""
         _require_actor(actor_id)

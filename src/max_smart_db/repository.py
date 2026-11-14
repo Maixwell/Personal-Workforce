@@ -520,6 +520,18 @@ class AlreadyAcknowledged:
 
 
 @dataclass(frozen=True)
+class AcknowledgementObserved:
+    """A fresh snapshot proved one committed acknowledgement."""
+
+    operation: OperationView
+
+
+@dataclass(frozen=True)
+class AcknowledgementNotProven:
+    """The snapshot did not prove a durable acknowledgement."""
+
+
+@dataclass(frozen=True)
 class NotUnknown:
     current_state: OperationStatus
 
@@ -649,6 +661,10 @@ AcknowledgeResult = Union[
     NotFound,
     DatabaseBusy,
     CommitAmbiguous,
+]
+InspectAcknowledgementResult = Union[
+    AcknowledgementObserved,
+    AcknowledgementNotProven,
 ]
 CreateConversationResult = Union[
     ConversationView,
@@ -794,6 +810,13 @@ class ConversationRepository(Protocol):
         operation_id: UUID,
     ) -> AcknowledgeResult:
         """Acknowledge one unknown outcome. Not implemented in R1."""
+
+    def inspect_acknowledged_unknown(
+        self,
+        actor_id: int,
+        operation_id: UUID,
+    ) -> InspectAcknowledgementResult:
+        """Prove one committed acknowledgement from a fresh read snapshot."""
 
     def get_operation(
         self,
