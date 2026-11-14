@@ -181,6 +181,8 @@ def _budget(claimed_at, wall_clock):
         return None
     if type(now) is not int:
         return None
+    if now < claimed_at:
+        return _ALLOWANCE_US
     return claimed_at + _ALLOWANCE_US - now
 
 

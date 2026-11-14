@@ -301,14 +301,55 @@ class SupervisedProviderTests(unittest.TestCase):
         )
         self.assertEqual(result.classification, "uncertain")
 
-    def test_backward_wall_clock_does_not_extend_budget(self):
-        readings = []
+    def test_wall_time_before_claim_caps_allowance(self):
+        self._assert_scheduled_allowance(CLAIMED_AT - 1, ALLOWANCE_US)
+
+    def test_241_second_backward_step_caps_allowance(self):
+        self._assert_scheduled_allowance(CLAIMED_AT - 241_000_000, ALLOWANCE_US)
+
+    def test_exact_maximum_allowance_is_480_seconds(self):
+        self._assert_scheduled_allowance(CLAIMED_AT, ALLOWANCE_US)
+
+    def test_elapsed_wall_time_reduces_allowance(self):
+        self._assert_scheduled_allowance(CLAIMED_AT + 100_000_000, 380_000_000)
+
+    def test_allowance_beyond_cutoff_starts_no_worker(self):
+        calls = {"wall": 0, "popen": 0}
 
         def wall():
-            readings.append("read")
-            return CLAIMED_AT + ALLOWANCE_US - 300_000
+            calls["wall"] += 1
+            return CLAIMED_AT + ALLOWANCE_US + 241_000_000
 
+        def popen(*_args, **_kwargs):
+            calls["popen"] += 1
+            raise AssertionError("worker started")
+
+        result = supervise(
+            claimed_at=CLAIMED_AT,
+            operation_id=OPERATION,
+            runner_id=RUNNER,
+            request_content="hello",
+            standing_context="standing",
+            wall_clock=wall,
+            fake="ok",
+            popen=popen,
+        )
+        self.assertEqual(calls, {"wall": 1, "popen": 0})
+        self.assertEqual(result.classification, "definite_non_send")
+        self.assertFalse(result.worker_started)
+
+    def test_reduced_allowance_stops_real_worker(self):
         server = _listen(self)
+        calls = {"wall": 0, "popen": 0}
+
+        def wall():
+            calls["wall"] += 1
+            return CLAIMED_AT + ALLOWANCE_US - 250_000
+
+        def popen(*args, **kwargs):
+            calls["popen"] += 1
+            return subprocess.Popen(*args, **kwargs)
+
         started = time.monotonic()
         result = supervise(
             claimed_at=CLAIMED_AT,
@@ -319,11 +360,51 @@ class SupervisedProviderTests(unittest.TestCase):
             wall_clock=wall,
             fake="block_read",
             socket_port=server.getsockname()[1],
+            popen=popen,
         )
         elapsed = time.monotonic() - started
-        self.assertEqual(readings, ["read"])
+        self.assertEqual(calls, {"wall": 1, "popen": 1})
         self.assertEqual(result.classification, "uncertain")
-        self.assertLess(elapsed, 1.2)
+        self.assertLess(elapsed, 1)
+
+    def _assert_scheduled_allowance(self, now, expected_us):
+        calls = {"wall": 0, "popen": 0}
+        processes = []
+
+        def wall():
+            calls["wall"] += 1
+            return now
+
+        def popen(_args, **kwargs):
+            calls["popen"] += 1
+            environment = dict(kwargs.get("env") or {})
+            environment["EXPECTED_ALLOWANCE_US"] = str(expected_us)
+            kwargs["env"] = environment
+            process = subprocess.Popen(
+                [sys.executable, "-c", _ALLOWANCE_PROBE],
+                **kwargs,
+            )
+            processes.append(process)
+            return process
+
+        started = time.monotonic()
+        result = supervise(
+            claimed_at=CLAIMED_AT,
+            operation_id=OPERATION,
+            runner_id=RUNNER,
+            request_content="hello",
+            standing_context="standing",
+            wall_clock=wall,
+            fake="block_read",
+            popen=popen,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(calls, {"wall": 1, "popen": 1})
+        self.assertEqual(result.classification, "uncertain")
+        self.assertIsNone(result.output)
+        self.assertLess(elapsed, 2)
+        self.assertEqual(len(processes), 1)
+        self.assertEqual(processes[0].returncode, 0)
 
     def test_delayed_start_keeps_original_deadline(self):
         server = _listen(self)
@@ -937,6 +1018,21 @@ def _child_env():
         **os.environ,
         "PYTHONPATH": str(SRC_ROOT) + (os.pathsep + current if current else ""),
     }
+
+
+_ALLOWANCE_PROBE = """\
+import json
+import os
+import sys
+import time
+job = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
+expected = int(os.environ["EXPECTED_ALLOWANCE_US"])
+scheduled = int(job["timeout_seconds"] * 1_000_000)
+remaining = (job["deadline_monotonic_ns"] - time.monotonic_ns()) // 1_000
+if scheduled != expected or remaining > expected or remaining < expected - 2_000_000:
+    sys.exit(2)
+sys.exit(0)
+"""
 
 
 _DESCENDANT_LEADER = """\
