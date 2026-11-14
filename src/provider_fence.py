@@ -25,12 +25,20 @@ Operational contract:
 - A host reboot releases local locks. It does not prove that a remote
   provider call was cancelled. Duplicate-charge risk remains after an
   uncertain remote outcome.
+- A disposable trust record stores only the fence path, device, and inode.
+  A reader accepts that record only when the record file's own device,
+  inode, and content digest match a pin captured at provisioning. The pin
+  is not stored in the record. File mode 0600 does not stop the owning
+  user from replacing the record, so a process that is given a new pin can
+  be pointed at a substituted record.
 """
 
 import ctypes
 import ctypes.util
 import errno
 import fcntl
+import hashlib
+import json
 import os
 import re
 import stat
@@ -43,6 +51,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _PRODUCTION_DATA = _PROJECT_ROOT / "data"
 PRODUCTION_FENCE_PATH = _PRODUCTION_DATA / "provider.fence"
 _MAGIC = b"max-smart-provider-fence-v1\n"
+_TRUST_VERSION = "max-smart-provider-fence-trust-v1"
+_TRUST_RECORD_NAME = "fence.trust"
+_FENCE_FILE_NAME = "provider.fence"
+_TRUST_RECORD_MAX_BYTES = 8192
 _ENV_PATH = "MAX_SMART_PROVIDER_FENCE"
 _ENV_DEVICE = "MAX_SMART_PROVIDER_FENCE_DEVICE"
 _ENV_INODE = "MAX_SMART_PROVIDER_FENCE_INODE"
@@ -70,6 +82,28 @@ class ProviderFenceConfig:
     path: str
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class TrustRecordPin:
+    """Identity of the trust record, captured outside the record file.
+
+    This pin is the disposable anchor. It is not written into the record.
+    Mode 0600 on the record does not replace it.
+    """
+
+    path: str
+    device: int
+    inode: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class DisposableFenceTrust:
+    """One new fence and the pin for the record that names it."""
+
+    fence: ProviderFenceConfig
+    pin: TrustRecordPin
 
 
 class FenceSafetyError(RuntimeError):
@@ -244,6 +278,131 @@ def canonical_fence_config(explicit):
     if not _valid_config(shared) or not _same_config(explicit, shared):
         return None
     return shared
+
+
+def provision_disposable_fence_trust(directory):
+    """Create one private fence and a separate trust record.
+
+    The directory must already be a private local directory. An existing
+    fence or record is left untouched and is not adopted. This function
+    does not publish an identity and does not delete or replace a file.
+    """
+
+    root = _trust_directory(directory)
+    fence_path = root / _FENCE_FILE_NAME
+    record_path = root / _TRUST_RECORD_NAME
+    parent_fd, _name = _open_parent(fence_path)
+    try:
+        if not _directory_is_local(parent_fd):
+            raise FenceSafetyError("fence_filesystem")
+        fence_status = _named_status(parent_fd, _FENCE_FILE_NAME)
+        record_status = _named_status(parent_fd, _TRUST_RECORD_NAME)
+        if record_status is not None:
+            if stat.S_ISLNK(record_status.st_mode):
+                raise FenceSafetyError("trust_record_symlink")
+            raise FenceSafetyError("trust_record_exists")
+        if fence_status is not None:
+            if stat.S_ISLNK(fence_status.st_mode):
+                raise FenceSafetyError("fence_symlink")
+            raise FenceSafetyError("fence_exists")
+    finally:
+        os.close(parent_fd)
+    fence = prepare_disposable_fence(str(fence_path))
+    payload = _trust_bytes(fence)
+    parent_fd, name = _open_parent(record_path)
+    descriptor = None
+    try:
+        try:
+            descriptor = os.open(
+                name,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise FenceSafetyError("trust_record_symlink") from error
+            if error.errno == errno.EEXIST:
+                raise FenceSafetyError("trust_record_exists") from error
+            raise FenceSafetyError("trust_record_create_failed") from error
+        os.set_inheritable(descriptor, False)
+        if os.write(descriptor, payload) != len(payload):
+            raise FenceSafetyError("trust_record_create_failed")
+        os.fsync(descriptor)
+        status = os.fstat(descriptor)
+        if not _private_regular(status):
+            raise FenceSafetyError("trust_record_permissions")
+        if not _local_apfs(descriptor, status.st_dev):
+            raise FenceSafetyError("fence_filesystem")
+        os.fsync(parent_fd)
+        pin = TrustRecordPin(
+            str(record_path),
+            status.st_dev,
+            status.st_ino,
+            hashlib.sha256(payload).hexdigest(),
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+    if not _valid_pin(pin):
+        raise FenceSafetyError("trust_record_create_failed")
+    return DisposableFenceTrust(fence, pin)
+
+
+def load_disposable_fence_trust(pin):
+    """Return the fence identity stored in a pinned trust record.
+
+    The record is read only. A missing, replaced, or rewritten record is
+    refused. The fence file's current inode is never copied into the result
+    ahead of the inode stored in the record.
+    """
+
+    if not _valid_pin(pin):
+        raise FenceSafetyError("trust_pin_invalid")
+    record = _absolute_path(pin.path)
+    if record is None or str(record) != pin.path:
+        raise FenceSafetyError("trust_pin_invalid")
+    if record.name != _TRUST_RECORD_NAME:
+        raise FenceSafetyError("trust_record_malformed")
+    if _under_production_data(record) or _cloud_path(record):
+        raise FenceSafetyError("production_fence_refused")
+    payload = _read_trust_record(pin)
+    if hashlib.sha256(payload).hexdigest() != pin.digest:
+        raise FenceSafetyError("trust_record_digest")
+    try:
+        config = _parse_trust_record(payload)
+    except FenceSafetyError as error:
+        if error.code == "trust_record_malformed" and (
+            payload == b"" or not payload.endswith(b"\n")
+        ):
+            raise FenceSafetyError("trust_record_truncated") from error
+        raise
+    if _under_production_data(config.path) or _cloud_path(config.path):
+        raise FenceSafetyError("fence_path_refused")
+    if not _record_fence_matches(config):
+        raise FenceSafetyError("fence_identity")
+    return config
+
+
+def publish_loaded_fence_trust(pin):
+    """Publish the fence identity named by a pinned record, once.
+
+    A conflicting identity that is already published is left unchanged.
+    """
+
+    config = load_disposable_fence_trust(pin)
+    publish_shared_fence_config(config)
+    return config
+
+
+def fence_config_from_trust(pin, explicit=None):
+    """Load a pinned record and refuse a different explicit fence identity."""
+
+    config = load_disposable_fence_trust(pin)
+    if explicit is not None and not _same_config(explicit, config):
+        raise FenceSafetyError("fence_identity_changed")
+    return config
 
 
 def fence_matches_config(config):
@@ -546,6 +705,192 @@ def _content_matches(descriptor):
     os.lseek(descriptor, 0, os.SEEK_SET)
     payload = os.read(descriptor, len(_MAGIC) + 1)
     return payload == _MAGIC
+
+
+def _trust_directory(directory):
+    root = _absolute_path(directory)
+    if root is None or root.name == "":
+        raise FenceSafetyError("fence_path_invalid")
+    if _under_production_data(root):
+        raise FenceSafetyError("production_fence_refused")
+    if _cloud_path(root):
+        raise FenceSafetyError("fence_path_refused")
+    return root
+
+
+def _named_status(parent_fd, name):
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise FenceSafetyError("fence_unreadable") from error
+
+
+def _directory_is_local(descriptor):
+    try:
+        status = os.fstat(descriptor)
+    except OSError as error:
+        raise FenceSafetyError("fence_unreadable") from error
+    return _local_apfs(descriptor, status.st_dev)
+
+
+def _private_regular(status):
+    return (
+        stat.S_ISREG(status.st_mode)
+        and not stat.S_ISLNK(status.st_mode)
+        and stat.S_IMODE(status.st_mode) == 0o600
+        and status.st_uid == os.geteuid()
+        and status.st_nlink == 1
+    )
+
+
+def _record_fence_matches(config):
+    """Verify the recorded fence without treating another reader as replacement.
+
+    A busy mutex means either this process holds the fence or another reader
+    is opening it. The held descriptor is authoritative in the first case.
+    Readers wait only when nobody holds that fence.
+    """
+
+    if fence_matches_config(config):
+        return True
+    if _active_held(config) is not None:
+        return False
+    mutex = _mutex_for(config.device, config.inode)
+    if not mutex.acquire(timeout=2):
+        return False
+    try:
+        opened = _open_verified(config)
+        if type(opened) is not tuple:
+            return False
+        os.close(opened[0])
+        return True
+    finally:
+        mutex.release()
+
+
+def _trust_bytes(config):
+    if not _valid_config(config):
+        raise FenceSafetyError("fence_identity_missing")
+    body = json.dumps(
+        {
+            "device": config.device,
+            "inode": config.inode,
+            "path": config.path,
+            "version": _TRUST_VERSION,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (body + "\n").encode("ascii")
+
+
+def _valid_pin(pin):
+    if (
+        type(pin) is not TrustRecordPin
+        or type(pin.path) is not str
+        or not pin.path.startswith("/")
+        or type(pin.device) is not int
+        or type(pin.inode) is not int
+        or type(pin.digest) is not str
+        or pin.device <= 0
+        or pin.inode <= 0
+        or len(pin.digest) != 64
+    ):
+        return False
+    return all(character in "0123456789abcdef" for character in pin.digest)
+
+
+def _read_trust_record(pin):
+    record = _absolute_path(pin.path)
+    parent_fd = None
+    descriptor = None
+    try:
+        parent_fd, name = _open_parent(record)
+        listed = _named_status(parent_fd, name)
+        if listed is None:
+            raise FenceSafetyError("trust_record_missing")
+        if stat.S_ISLNK(listed.st_mode):
+            raise FenceSafetyError("trust_record_symlink")
+        if not stat.S_ISREG(listed.st_mode):
+            raise FenceSafetyError("trust_record_malformed")
+        if stat.S_IMODE(listed.st_mode) != 0o600:
+            raise FenceSafetyError("trust_record_permissions")
+        if listed.st_uid != os.geteuid():
+            raise FenceSafetyError("trust_record_owner")
+        if listed.st_nlink != 1:
+            raise FenceSafetyError("trust_record_hard_link")
+        if listed.st_dev != pin.device or listed.st_ino != pin.inode:
+            raise FenceSafetyError("trust_record_identity")
+        if listed.st_size > _TRUST_RECORD_MAX_BYTES:
+            raise FenceSafetyError("trust_record_malformed")
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise FenceSafetyError("trust_record_symlink") from error
+            raise FenceSafetyError("trust_record_unreadable") from error
+        os.set_inheritable(descriptor, False)
+        current = os.fstat(descriptor)
+        if (
+            current.st_dev != pin.device
+            or current.st_ino != pin.inode
+            or not _private_regular(current)
+        ):
+            if current.st_uid != os.geteuid():
+                raise FenceSafetyError("trust_record_owner")
+            if current.st_nlink != 1:
+                raise FenceSafetyError("trust_record_hard_link")
+            if stat.S_IMODE(current.st_mode) != 0o600:
+                raise FenceSafetyError("trust_record_permissions")
+            raise FenceSafetyError("trust_record_identity")
+        if not _local_apfs(descriptor, current.st_dev):
+            raise FenceSafetyError("fence_filesystem")
+        payload = os.read(descriptor, _TRUST_RECORD_MAX_BYTES + 1)
+        if len(payload) != current.st_size:
+            raise FenceSafetyError("trust_record_unreadable")
+        return payload
+    except FenceSafetyError:
+        raise
+    except OSError as error:
+        raise FenceSafetyError("trust_record_unreadable") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _parse_trust_record(payload):
+    if type(payload) is not bytes or payload == b"" or not payload.endswith(b"\n"):
+        raise FenceSafetyError("trust_record_truncated")
+    if len(payload) > _TRUST_RECORD_MAX_BYTES or payload.count(b"\n") != 1:
+        raise FenceSafetyError("trust_record_malformed")
+    try:
+        parsed = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise FenceSafetyError("trust_record_malformed") from None
+    if (
+        type(parsed) is not dict
+        or set(parsed) != {"device", "inode", "path", "version"}
+        or parsed["version"] != _TRUST_VERSION
+        or type(parsed["path"]) is not str
+        or type(parsed["device"]) is not int
+        or type(parsed["inode"]) is not int
+        or type(parsed["device"]) is bool
+        or type(parsed["inode"]) is bool
+    ):
+        raise FenceSafetyError("trust_record_malformed")
+    config = ProviderFenceConfig(parsed["path"], parsed["device"], parsed["inode"])
+    if not _valid_config(config) or _trust_bytes(config) != payload:
+        raise FenceSafetyError("trust_record_malformed")
+    return config
 
 
 def _valid_config(config):
