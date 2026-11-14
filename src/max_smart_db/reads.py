@@ -30,9 +30,17 @@ class ReadInputError(ValueError):
 class SqliteConversationReader:
     """Read conversations, operations, and committed messages."""
 
-    def __init__(self, clock, runner_id):
+    def __init__(
+        self,
+        clock,
+        runner_id,
+        provider_fence_path=None,
+        provider_fence_config=None,
+    ):
         self.clock = clock
         self.runner_id = runner_id
+        self.provider_fence_path = provider_fence_path
+        self.provider_fence_config = provider_fence_config
 
     def get_conversation(self, actor_id, conversation_id):
         """Return one owned conversation, or NotFound."""

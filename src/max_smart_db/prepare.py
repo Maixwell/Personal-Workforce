@@ -24,6 +24,7 @@ from .reads import _operation_view
 from .recovery import (
     _ConditionalRace,
     _is_lock_failure,
+    _recovery_gate,
     recover_slot_locked,
 )
 from .repository import (
@@ -34,11 +35,13 @@ from .repository import (
     KeyBindingMismatch,
     LiveQueued,
     LiveRunning,
+    LocalProviderActive,
     ModelBusy,
     NotFound,
     OperationStatus,
     Prepared,
     PrepareCommand,
+    ProviderFenceUnproven,
     QueuedReservation,
     RepositoryIntegrityError,
     SlotFree,
@@ -46,6 +49,7 @@ from .repository import (
     InconsistentSlot,
     OwnershipMismatch,
 )
+from provider_fence import FenceHeld, release_fence
 
 
 _RUNNER = re.compile(r"^[A-Za-z0-9_-]{22}$")
@@ -65,9 +69,24 @@ class _PrepareDatabaseError(Exception):
 
 
 def prepare(repository, command):
-    """Run PREPARE in the authoritative order."""
+    """Run PREPARE while the global provider fence is held."""
     _validate_command(command)
     _validate_runner(repository.runner_id)
+    gate = _recovery_gate(repository)
+    if type(gate) is ProviderFenceUnproven:
+        return gate
+    if type(gate) is LocalProviderActive:
+        return ModelBusy()
+    if type(gate) is not FenceHeld:
+        return ProviderFenceUnproven("fence_unproven")
+    try:
+        return _prepare_in_fence(repository, command, gate)
+    finally:
+        release_fence(gate)
+
+
+def _prepare_in_fence(repository, command, permit):
+    """Run PREPARE in the authoritative order."""
     key_digest = idempotency_key_digest(command.idempotency_key)
     operation_id = uuid.uuid4()
     body_complete = False
@@ -127,7 +146,10 @@ def prepare(repository, command):
                         IDEMPOTENCY_EXPIRATION_US,
                         "idempotency_timestamp_overflow",
                     )
-                    recovery_result, recovery_attempt = recover_slot_locked(now)
+                    recovery_result, recovery_attempt = recover_slot_locked(
+                        now,
+                        permit,
+                    )
                     mutation_started = recovery_attempt.mutation_started
                     if recovery_attempt.operation_id is not None:
                         reconciliation_id = recovery_attempt.operation_id
@@ -136,58 +158,65 @@ def prepare(repository, command):
                         (InconsistentSlot, OwnershipMismatch),
                     ):
                         raise RepositoryIntegrityError()
-
-                    blocker = Operation.objects.filter(
-                        conversation_id=conversation.id,
-                        blocks_conversation=1,
-                    ).first()
-                    if blocker is not None:
-                        result = ConversationBlocked(
-                            operation_id=blocker.id,
-                            status=OperationStatus(blocker.status),
-                        )
-                    elif isinstance(recovery_result, (LiveQueued, LiveRunning)):
+                    if isinstance(recovery_result, ProviderFenceUnproven):
+                        result = recovery_result
+                    elif isinstance(recovery_result, LocalProviderActive):
                         result = ModelBusy()
-                    elif not isinstance(recovery_result, SlotFree):
-                        # Successful recovery always leaves the slot free.
-                        if GlobalModelSlot.objects.filter(
-                            id=1,
-                            operation_id__isnull=True,
-                            runner_id__isnull=True,
-                            reservation_expires_at_us__isnull=True,
-                            lease_expires_at_us__isnull=True,
-                            acquired_at_us__isnull=True,
-                        ).count() != 1:
-                            raise RepositoryIntegrityError()
-                        result, delayed_integrity = _insert_preparation(
-                            command,
-                            operation_id,
-                            request_hash,
-                            key_digest,
-                            now,
-                            reservation_expires,
-                            key_expires,
-                            repository.runner_id,
-                        )
-                        mutation_started = (
-                            mutation_started or not delayed_integrity
-                        )
-                        reconciliation_id = operation_id
                     else:
-                        result, delayed_integrity = _insert_preparation(
-                            command,
-                            operation_id,
-                            request_hash,
-                            key_digest,
-                            now,
-                            reservation_expires,
-                            key_expires,
-                            repository.runner_id,
-                        )
-                        mutation_started = (
-                            mutation_started or not delayed_integrity
-                        )
-                        reconciliation_id = operation_id
+                        blocker = Operation.objects.filter(
+                            conversation_id=conversation.id,
+                            blocks_conversation=1,
+                        ).first()
+                        if blocker is not None:
+                            result = ConversationBlocked(
+                                operation_id=blocker.id,
+                                status=OperationStatus(blocker.status),
+                            )
+                        elif isinstance(
+                            recovery_result,
+                            (LiveQueued, LiveRunning),
+                        ):
+                            result = ModelBusy()
+                        elif not isinstance(recovery_result, SlotFree):
+                            # Successful recovery always leaves the slot free.
+                            if GlobalModelSlot.objects.filter(
+                                id=1,
+                                operation_id__isnull=True,
+                                runner_id__isnull=True,
+                                reservation_expires_at_us__isnull=True,
+                                lease_expires_at_us__isnull=True,
+                                acquired_at_us__isnull=True,
+                            ).count() != 1:
+                                raise RepositoryIntegrityError()
+                            result, delayed_integrity = _insert_preparation(
+                                command,
+                                operation_id,
+                                request_hash,
+                                key_digest,
+                                now,
+                                reservation_expires,
+                                key_expires,
+                                repository.runner_id,
+                            )
+                            mutation_started = (
+                                mutation_started or not delayed_integrity
+                            )
+                            reconciliation_id = operation_id
+                        else:
+                            result, delayed_integrity = _insert_preparation(
+                                command,
+                                operation_id,
+                                request_hash,
+                                key_digest,
+                                now,
+                                reservation_expires,
+                                key_expires,
+                                repository.runner_id,
+                            )
+                            mutation_started = (
+                                mutation_started or not delayed_integrity
+                            )
+                            reconciliation_id = operation_id
             body_complete = True
     except _ConditionalRace:
         raise RepositoryIntegrityError() from None

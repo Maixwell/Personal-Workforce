@@ -1,8 +1,24 @@
-"""Fenced recovery for the singleton global model slot."""
+"""Fenced recovery for the singleton global model slot.
+
+The caller holds the one canonical provider fence before the writer
+transaction starts and releases it only after commit or rollback. A busy
+fence returns LocalProviderActive and changes nothing. An unverifiable fence
+returns ProviderFenceUnproven and changes nothing. Neither result is an idle
+worker. This module does not delete the fence or repeat an unconfirmed write.
+"""
 
 from dataclasses import dataclass
 
 from django.db import IntegrityError, OperationalError, transaction
+
+from provider_fence import (
+    FenceHeld,
+    ProviderFenceConfig,
+    canonical_fence_config,
+    fence_still_matches,
+    release_fence,
+    shared_fence_config,
+)
 
 from .creation import _read_clock_once
 from .models import GlobalModelSlot, Operation
@@ -13,8 +29,10 @@ from .repository import (
     InconsistentSlot,
     LiveQueued,
     LiveRunning,
+    LocalProviderActive,
     MarkedOutcomeUnknown,
     OwnershipMismatch,
+    ProviderFenceUnproven,
     RepositoryIntegrityError,
     SlotFree,
 )
@@ -42,15 +60,58 @@ class _Attempt:
     operation_id: object = None
 
 
-def recover_slot(clock):
+def fence_config_for(repository):
+    """Return the one canonical fence, or None when identity does not match."""
+
+    shared = shared_fence_config()
+    if type(shared) is not ProviderFenceConfig:
+        return None
+    explicit = getattr(repository, "provider_fence_config", None)
+    if explicit is None:
+        legacy = getattr(repository, "provider_fence_path", None)
+        if type(legacy) is ProviderFenceConfig:
+            explicit = legacy
+        elif legacy is not None:
+            return None
+    if explicit is None:
+        return shared
+    return canonical_fence_config(explicit)
+
+
+def _recovery_gate(repository):
+    from provider_fence import FenceBusy, FenceUnproven, acquire_exclusive
+
+    config = fence_config_for(repository)
+    if config is None:
+        return ProviderFenceUnproven("fence_identity_missing")
+    gate = acquire_exclusive(config)
+    if type(gate) is FenceHeld:
+        return gate
+    if type(gate) is FenceBusy:
+        return LocalProviderActive()
+    code = gate.code if type(gate) is FenceUnproven else "fence_unproven"
+    return ProviderFenceUnproven(code)
+
+
+def recover_slot(clock, repository):
     """Classify or recover an expired singleton slot in one writer transaction."""
+    gate = _recovery_gate(repository)
+    if type(gate) is not FenceHeld:
+        return gate
+    try:
+        return _recover_holding(clock, gate)
+    finally:
+        release_fence(gate)
+
+
+def _recover_holding(clock, permit):
     body_complete = False
     attempt = None
     now = None
     try:
         with transaction.atomic(durable=True):
             now = _read_clock_once(clock)
-            result, attempt = recover_slot_locked(now)
+            result, attempt = recover_slot_locked(now, permit)
             body_complete = True
     except _ConditionalRace:
         return _classify_after_race(now)
@@ -74,8 +135,14 @@ def recover_slot(clock):
     return result
 
 
-def recover_slot_locked(now):
-    """Recover an eligible slot inside the caller's writer transaction."""
+def recover_slot_locked(now, permit):
+    """Recover an eligible slot inside the caller's writer transaction.
+
+    The caller already holds the global fence. This function does not wait
+    for a lock and does not release one.
+    """
+    if type(permit) is not FenceHeld or not fence_still_matches(permit):
+        return ProviderFenceUnproven("fence_unproven"), _Attempt()
     attempt = _Attempt()
     classified = _inspect_slot(now)
     if isinstance(classified, _RecoverQueued):

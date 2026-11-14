@@ -778,9 +778,11 @@ class ReadinessRehearsalTests(unittest.TestCase):
         self.assertEqual(payload["content"], "persisted original")
         self.assertEqual(payload["hidden"], "NotFound")
         self.assertEqual(payload["hidden_ack"], "NotFound")
-        self.assertEqual(
-            payload["outcomes"],
-            ["RetryPrepared", "RetrySourceNotEligible"],
+        self.assertEqual(payload["outcomes"].count("RetryPrepared"), 1)
+        self.assertIn(
+            payload["outcomes"][0] if payload["outcomes"][1] == "RetryPrepared"
+            else payload["outcomes"][1],
+            ("ModelBusy", "RetrySourceNotEligible"),
         )
         self.assertEqual(payload["children"], 1)
 

@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 
+from provider_fence import ProviderFenceConfig, acquire_worker_fence
+
 
 _MAX_JOB_BYTES = 1_000_000
 _MODEL = "gpt-5.6-sol"
@@ -62,7 +64,121 @@ def _run_job(raw):
     if time.monotonic_ns() >= deadline_ns:
         _emit(_not_sent(job))
         return
+    if not _authorize(job, deadline_ns):
+        _emit(_not_sent(job))
+        return
+    if time.monotonic_ns() >= deadline_ns:
+        _emit(_not_sent(job))
+        return
     _execute(job)
+
+
+def _authorize(job, deadline_ns):
+    """Lock the fence, report LOCKED, and wait for one GO on the control fd."""
+
+    path = job.get("fence_path")
+    device = job.get("fence_device")
+    inode = job.get("fence_inode")
+    mode = job.get("mode")
+    descriptor = job.get("control_fd")
+    if (
+        type(path) is not str
+        or type(device) is not int
+        or type(inode) is not int
+        or mode not in ("fake", "openai")
+        or type(descriptor) is not int
+        or descriptor < 0
+    ):
+        return False
+    try:
+        os.set_inheritable(descriptor, False)
+    except OSError:
+        return False
+    if not acquire_worker_fence(ProviderFenceConfig(path, device, inode)):
+        return False
+    try:
+        _write_locked(descriptor, mode)
+    except OSError:
+        return False
+    if _read_control(descriptor, deadline_ns) != "go":
+        return False
+    if time.monotonic_ns() >= deadline_ns:
+        return False
+    watcher = threading.Thread(
+        target=_watch_control,
+        args=(descriptor,),
+        daemon=True,
+    )
+    watcher.start()
+    return True
+
+
+def _watch_control(descriptor):
+    try:
+        while True:
+            readable, _, _ = select.select([descriptor], [], [], 1)
+            if not readable:
+                continue
+            chunk = os.read(descriptor, 1024)
+            break
+    except Exception:
+        chunk = b""
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+
+
+def _write_locked(descriptor, mode):
+    payload = json.dumps(
+        {"type": "locked", "mode": mode},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload += b"\n"
+    view = payload
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("control_write")
+        view = view[written:]
+
+
+def _read_control(descriptor, deadline_ns):
+    buffer = bytearray()
+    while time.monotonic_ns() < deadline_ns:
+        remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+        if remaining <= 0:
+            return None
+        try:
+            readable, _, _ = select.select(
+                [descriptor],
+                [],
+                [],
+                min(remaining, 0.05),
+            )
+        except (OSError, ValueError):
+            return None
+        if not readable:
+            continue
+        try:
+            chunk = os.read(descriptor, 1024)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buffer.extend(chunk)
+        if b"\n" not in buffer:
+            if len(buffer) > 256:
+                return None
+            continue
+        line, separator, extra = bytes(buffer).partition(b"\n")
+        if separator != b"\n" or extra != b"":
+            return None
+        try:
+            parsed = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if type(parsed) is not dict or parsed.get("type") != "go":
+            return None
+        return "go"
+    return None
 
 
 def _arm_guards(parent_pid, deadline_ns):

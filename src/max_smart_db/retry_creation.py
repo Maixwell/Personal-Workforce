@@ -20,9 +20,12 @@ from .prepare import (
     _validate_runner,
 )
 from .reads import _operation_view
+from provider_fence import FenceHeld, release_fence
+
 from .recovery import (
     _ConditionalRace,
     _is_lock_failure,
+    _recovery_gate,
     recover_slot_locked,
 )
 from .repository import (
@@ -33,7 +36,9 @@ from .repository import (
     KeyBindingMismatch,
     LiveQueued,
     LiveRunning,
+    LocalProviderActive,
     ModelBusy,
+    ProviderFenceUnproven,
     NotFound,
     OperationStatus,
     OwnershipMismatch,
@@ -60,6 +65,21 @@ def create_retry(repository, command):
     """Insert one new QUEUED retry, or return the existing key binding."""
     _validate_command(command)
     _validate_runner(repository.runner_id)
+    gate = _recovery_gate(repository)
+    if type(gate) is ProviderFenceUnproven:
+        return gate
+    if type(gate) is LocalProviderActive:
+        return ModelBusy()
+    if type(gate) is not FenceHeld:
+        return ProviderFenceUnproven("fence_unproven")
+    try:
+        return _create_retry_in_fence(repository, command, gate)
+    finally:
+        release_fence(gate)
+
+
+def _create_retry_in_fence(repository, command, permit):
+    """Insert one new QUEUED retry while the caller holds the fence."""
     key_digest = idempotency_key_digest(command.idempotency_key)
     operation_id = uuid.uuid4()
     body_complete = False
@@ -125,6 +145,7 @@ def create_retry(repository, command):
                             request_hash,
                             key_digest,
                             now,
+                            permit,
                         )
             body_complete = True
     except _SourceRejected:
@@ -194,6 +215,7 @@ def _reserve_retry(
     request_hash,
     key_digest,
     now,
+    permit,
 ):
     reservation_expires = _checked_add(
         now,
@@ -205,13 +227,17 @@ def _reserve_retry(
         IDEMPOTENCY_EXPIRATION_US,
         "idempotency_timestamp_overflow",
     )
-    recovery_result, recovery_attempt = recover_slot_locked(now)
+    recovery_result, recovery_attempt = recover_slot_locked(now, permit)
     mutation_started = recovery_attempt.mutation_started
     reconciliation_id = operation_id
     if recovery_attempt.operation_id is not None:
         reconciliation_id = recovery_attempt.operation_id
     if isinstance(recovery_result, (InconsistentSlot, OwnershipMismatch)):
         raise RepositoryIntegrityError()
+    if isinstance(recovery_result, ProviderFenceUnproven):
+        return recovery_result, False, mutation_started, reconciliation_id
+    if isinstance(recovery_result, LocalProviderActive):
+        return ModelBusy(), False, mutation_started, reconciliation_id
     blocker = Operation.objects.filter(
         conversation_id=conversation.id,
         blocks_conversation=1,

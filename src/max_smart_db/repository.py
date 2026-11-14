@@ -500,6 +500,18 @@ class MarkedOutcomeUnknown:
 
 
 @dataclass(frozen=True)
+class LocalProviderActive:
+    """A provider-capable worker holds the global fence. The slot stays put."""
+
+
+@dataclass(frozen=True)
+class ProviderFenceUnproven:
+    """The global fence cannot be verified. No slot was released."""
+
+    code: str
+
+
+@dataclass(frozen=True)
 class InconsistentSlot:
     pass
 
@@ -551,6 +563,7 @@ PrepareResult = Union[
     NotFound,
     DatabaseBusy,
     CommitAmbiguous,
+    ProviderFenceUnproven,
 ]
 RetryCreateResult = Union[
     RetryPrepared,
@@ -563,6 +576,7 @@ RetryCreateResult = Union[
     NotFound,
     DatabaseBusy,
     CommitAmbiguous,
+    ProviderFenceUnproven,
 ]
 InspectRetryCreationResult = Union[
     RetryCreationObserved,
@@ -649,6 +663,8 @@ RecoveryResult = Union[
     LiveRunning,
     CancelledExpiredQueued,
     MarkedOutcomeUnknown,
+    LocalProviderActive,
+    ProviderFenceUnproven,
     InconsistentSlot,
     OwnershipMismatch,
     DatabaseBusy,

@@ -824,7 +824,13 @@ class PrepareTests(unittest.TestCase):
             """
         )
         payload = _payload(self, result)
-        self.assertEqual(payload["outcomes"], ["Existing", "Prepared"])
+        self.assertEqual(payload["outcomes"].count("Prepared"), 1)
+        self.assertIn(
+            payload["outcomes"][0]
+            if payload["outcomes"][1] == "Prepared"
+            else payload["outcomes"][1],
+            ("Existing", "ModelBusy"),
+        )
         self.assertEqual(payload["failures"], [])
         self.assertEqual(payload["counts"], [1, 1])
 

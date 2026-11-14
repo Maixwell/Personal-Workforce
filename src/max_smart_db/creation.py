@@ -77,7 +77,7 @@ class SqliteConversationRepository(SqliteConversationReader):
         """Classify or recover the singleton global slot."""
         from .recovery import recover_slot
 
-        return recover_slot(self.clock)
+        return recover_slot(self.clock, self)
 
     def acknowledge_unknown(self, actor_id, operation_id):
         """Acknowledge one unknown outcome without changing history."""

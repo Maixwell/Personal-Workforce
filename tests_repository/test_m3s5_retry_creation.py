@@ -583,7 +583,11 @@ class RetryCreationTests(unittest.TestCase):
             """
         ))
         kinds = sorted(item["type"] for item in payload["outcomes"])
-        self.assertEqual(kinds, ["RetryPrepared", "RetrySourceNotEligible"])
+        self.assertEqual(kinds.count("RetryPrepared"), 1)
+        self.assertIn(
+            kinds[0] if kinds[1] == "RetryPrepared" else kinds[1],
+            ("ModelBusy", "RetrySourceNotEligible"),
+        )
         self.assertEqual(
             [item["provider"] for item in payload["outcomes"]],
             [0, 0],

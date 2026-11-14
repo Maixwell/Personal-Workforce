@@ -1,9 +1,16 @@
-"""Supervise one provider worker through the durable claim deadline."""
+"""Supervise one provider worker through the durable claim deadline.
+
+The worker, not this supervisor, holds the global provider fence. After the
+worker reports LOCKED, a fresh durable claim proof is required before GO.
+No proof, a missed cutoff, or a lost control channel withholds GO. The
+original allowance is not extended while the handshake waits.
+"""
 
 import json
 import os
 import select
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -20,6 +27,13 @@ from max_smart_db.config import (
 _ALLOWANCE_US = EXECUTION_DEADLINE_US - RECOVERY_CLOCK_SKEW_MARGIN_US
 _MAX_FRAME_BYTES = 1_000_000
 _MODEL = "gpt-5.6-sol"
+
+
+class _MissingFence:
+    pass
+
+
+_UNSET = _MissingFence()
 
 
 @dataclass(frozen=True)
@@ -48,8 +62,14 @@ def build_service_provider(
     stderr=subprocess.DEVNULL,
     socket_port=None,
     ready_path=None,
+    fence_config=_UNSET,
+    prove_claim=None,
 ):
     """Return the ConversationService provider callable."""
+
+    if fake is None:
+        prove_claim = None
+    checker = _durable_claim_matches if prove_claim is None else prove_claim
 
     def provider(
         *,
@@ -61,6 +81,17 @@ def build_service_provider(
         request_content,
         standing_context,
     ):
+        def prove():
+            try:
+                return checker(
+                    actor_id=actor_id,
+                    operation_id=operation_id,
+                    runner_id=runner_id,
+                    claimed_at=claimed_at,
+                ) is True
+            except Exception:
+                return False
+
         result = supervise(
             claimed_at=claimed_at,
             operation_id=str(operation_id),
@@ -78,6 +109,9 @@ def build_service_provider(
             stderr=stderr,
             socket_port=socket_port,
             ready_path=ready_path,
+            fence_config=fence_config,
+            actor_id=actor_id,
+            prove_claim=prove,
         )
         return _to_service(result)
 
@@ -102,6 +136,9 @@ def supervise(
     stderr=subprocess.DEVNULL,
     socket_port=None,
     ready_path=None,
+    fence_config=_UNSET,
+    actor_id=None,
+    prove_claim=None,
 ):
     """Run at most one worker. A missed cutoff never starts one."""
 
@@ -110,7 +147,21 @@ def supervise(
         return _uncertain()
     if allowance <= 0:
         return SupervisionResult("definite_non_send")
+    if fake is None:
+        def prove_claim():
+            try:
+                return _durable_claim_matches(
+                    actor_id=actor_id,
+                    operation_id=operation_id,
+                    runner_id=runner_id,
+                    claimed_at=claimed_at,
+                ) is True
+            except Exception:
+                return False
     deadline_ns = monotonic_ns() + allowance * 1_000
+    config = _select_fence_config(fence_config)
+    if config is None or not _fence_matches(config):
+        return SupervisionResult("definite_non_send", calls=0)
     if before_popen is not None:
         before_popen()
     if monotonic_ns() >= deadline_ns:
@@ -130,42 +181,66 @@ def supervise(
         "timeout_seconds": timeout_seconds,
         "socket_port": socket_port,
         "ready_path": ready_path,
+        "fence_path": config.path,
+        "fence_device": config.device,
+        "fence_inode": config.inode,
     }
+    def start_worker():
+        parent, child = socket.socketpair()
+        try:
+            child.set_inheritable(True)
+            payload_job = dict(job)
+            payload_job["control_fd"] = child.fileno()
+            payload = json.dumps(
+                payload_job,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            payload += b"\n"
+            started = popen(
+                [sys.executable, "-m", "provider_worker"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                close_fds=True,
+                start_new_session=True,
+                pass_fds=(child.fileno(),),
+                env=_worker_env(),
+            )
+        except Exception:
+            parent.close()
+            child.close()
+            raise
+        child.close()
+        parent.set_inheritable(False)
+        try:
+            started.stdin.write(payload)
+            started.stdin.close()
+        except Exception:
+            parent.close()
+            _stop(started, None)
+            raise
+        return started, parent
+
+    proc = None
+    control = None
     try:
-        proc = spawn_worker(job, popen=popen, stderr=stderr)
+        proc, control = start_worker()
     except Exception:
         return _uncertain()
     try:
+        if _handshake(proc, control, deadline_ns, prove_claim, config) != "go":
+            _close_control(control)
+            control = None
         if on_worker_start is not None:
             on_worker_start(proc.pid)
         return _finish(proc, deadline_ns, job, stop)
     finally:
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             _stop(proc, stop)
-        _close_pipes(proc)
-
-
-def spawn_worker(job, *, popen=subprocess.Popen, stderr=subprocess.DEVNULL):
-    """Start one session-leading worker. The job travels on stdin."""
-
-    payload = json.dumps(job, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    payload += b"\n"
-    proc = popen(
-        [sys.executable, "-m", "provider_worker"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=stderr,
-        close_fds=True,
-        start_new_session=True,
-        env=_worker_env(),
-    )
-    try:
-        proc.stdin.write(payload)
-        proc.stdin.close()
-    except Exception:
-        _stop(proc, None)
-        raise
-    return proc
+        _close_control(control)
+        if proc is not None:
+            _close_pipes(proc)
 
 
 def _budget(claimed_at, wall_clock):
@@ -381,6 +456,124 @@ def _usable(text):
 
 def _uncertain(worker_started=False):
     return SupervisionResult("uncertain", worker_started=worker_started)
+
+
+def _handshake(proc, control, deadline_ns, prove_claim, fence_config):
+    """LOCKED, then a fresh proof, then one GO. The budget is not reset."""
+
+    if _read_control(proc, control, deadline_ns) != "locked":
+        return "withheld"
+    if time.monotonic_ns() >= deadline_ns or prove_claim is None:
+        return "withheld"
+    try:
+        proven = prove_claim()
+    except Exception:
+        return "withheld"
+    if proven is not True or time.monotonic_ns() >= deadline_ns:
+        return "withheld"
+    if not _fence_matches(fence_config):
+        return "withheld"
+    try:
+        control.sendall(b'{"type":"go"}\n')
+    except Exception:
+        return "go"
+    return "go"
+
+
+def _read_control(proc, control, deadline_ns):
+    if control is None:
+        return None
+    buffer = bytearray()
+    while time.monotonic_ns() < deadline_ns:
+        if proc.poll() is not None:
+            return None
+        remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+        if remaining <= 0:
+            return None
+        try:
+            readable, _, _ = select.select([control], [], [], min(remaining, 0.05))
+        except (OSError, ValueError):
+            return None
+        if not readable:
+            continue
+        try:
+            chunk = control.recv(1024)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buffer.extend(chunk)
+        if b"\n" not in buffer:
+            if len(buffer) > 256:
+                return None
+            continue
+        line, separator, extra = bytes(buffer).partition(b"\n")
+        if separator != b"\n" or extra != b"":
+            return None
+        try:
+            parsed = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if type(parsed) is not dict:
+            return None
+        kind = parsed.get("type")
+        if kind not in ("locked", "go"):
+            return None
+        return kind
+    return None
+
+
+def _close_control(control):
+    if control is None:
+        return
+    try:
+        control.close()
+    except OSError:
+        pass
+
+
+def _select_fence_config(fence_config):
+    from provider_fence import ProviderFenceConfig, canonical_fence_config, shared_fence_config
+
+    if fence_config is _UNSET:
+        shared = shared_fence_config()
+        if type(shared) is not ProviderFenceConfig:
+            return None
+        return shared
+    return canonical_fence_config(fence_config)
+
+
+def _fence_matches(config):
+    from provider_fence import fence_matches_config
+
+    return fence_matches_config(config)
+
+
+def _durable_claim_matches(*, actor_id, operation_id, runner_id, claimed_at):
+    from uuid import UUID
+
+    from max_smart_db.claim_confirmation import confirm_durable_claim
+    from max_smart_db.repository import DurableClaimConfirmed
+
+    if type(operation_id) is str:
+        try:
+            operation_id = UUID(operation_id)
+        except ValueError:
+            return False
+    if type(operation_id) is not UUID or type(claimed_at) is not int:
+        return False
+    proof = confirm_durable_claim(
+        actor_id,
+        operation_id,
+        runner_id,
+        claimed_at,
+    )
+    return (
+        type(proof) is DurableClaimConfirmed
+        and proof.operation_id == operation_id
+        and proof.runner_id == runner_id
+        and proof.claimed_at == claimed_at
+    )
 
 
 def _worker_env():

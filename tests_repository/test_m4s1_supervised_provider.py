@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -20,17 +21,146 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 PRODUCTION_DATABASE = PROJECT_ROOT / "data" / "max_smart.sqlite3"
+PRODUCTION_FENCE = PROJECT_ROOT / "data" / "provider.fence"
 SESSION_FILE = PROJECT_ROOT / "data" / "current_session.json"
 sys.path.insert(0, str(SRC_ROOT))
 
 import provider_supervisor  # noqa: E402
+from provider_fence import prepare_disposable_fence, publish_shared_fence_config  # noqa: E402
 from provider_supervisor import (  # noqa: E402
     _close_pipes,
     _stop,
     build_service_provider,
-    spawn_worker,
-    supervise,
 )
+from provider_supervisor import supervise as _supervise  # noqa: E402
+
+_TEST_FENCE = None
+
+
+_FENCE_ENV = (
+    "MAX_SMART_PROVIDER_FENCE",
+    "MAX_SMART_PROVIDER_FENCE_DEVICE",
+    "MAX_SMART_PROVIDER_FENCE_INODE",
+)
+
+
+def _drop_published_fence():
+    for name in _FENCE_ENV:
+        os.environ.pop(name, None)
+
+
+def _spawn_fake_worker(job, *, popen=subprocess.Popen, stderr=subprocess.DEVNULL):
+    """Start only a fake worker. Real-mode jobs are rejected before launch."""
+
+    if job.get("mode") != "fake" or type(job.get("fake")) is not str:
+        raise RuntimeError("test support cannot start a real provider worker")
+    parent, child = socket.socketpair()
+    try:
+        child.set_inheritable(True)
+        payload_job = dict(job)
+        payload_job["mode"] = "fake"
+        payload_job["control_fd"] = child.fileno()
+        payload = json.dumps(
+            payload_job,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        environment = os.environ.copy()
+        root = str(SRC_ROOT)
+        current = environment.get("PYTHONPATH", "")
+        parts = [part for part in current.split(os.pathsep) if part]
+        if root not in parts:
+            environment["PYTHONPATH"] = (
+                os.pathsep.join((root, *parts)) if parts else root
+            )
+        process = popen(
+            [sys.executable, "-m", "provider_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            close_fds=True,
+            start_new_session=True,
+            pass_fds=(child.fileno(),),
+            env=environment,
+        )
+    except Exception:
+        parent.close()
+        child.close()
+        raise
+    child.close()
+    parent.set_inheritable(False)
+    process._provider_control = parent
+    try:
+        process.stdin.write(payload)
+        process.stdin.close()
+    except Exception:
+        parent.close()
+        process.kill()
+        raise
+    return process
+
+
+def _read_worker_frame(process, deadline_ns):
+    control = getattr(process, "_provider_control", None)
+    if control is None:
+        return None
+    previous = control.gettimeout()
+    buffer = bytearray()
+    try:
+        while time.monotonic_ns() < deadline_ns:
+            remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+            if remaining <= 0:
+                return None
+            control.settimeout(min(remaining, 0.05))
+            try:
+                chunk = control.recv(1024)
+            except (TimeoutError, socket.timeout):
+                continue
+            if not chunk:
+                return None
+            buffer.extend(chunk)
+            if b"\n" not in buffer:
+                continue
+            line, _, extra = bytes(buffer).partition(b"\n")
+            if extra:
+                return None
+            try:
+                parsed = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            if type(parsed) is not dict:
+                return None
+            return parsed
+        return None
+    finally:
+        try:
+            control.settimeout(previous)
+        except OSError:
+            pass
+
+
+def _release_fake_locked_worker(process, deadline_ns, **_caller):
+    """Release only a worker that itself reported fake mode."""
+
+    frame = _read_worker_frame(process, deadline_ns)
+    if (
+        type(frame) is not dict
+        or frame.get("type") != "locked"
+        or frame.get("mode") != "fake"
+    ):
+        return False
+    if time.monotonic_ns() >= deadline_ns:
+        return False
+    process._provider_control.sendall(b'{"type":"go"}\n')
+    return True
+
+
+def supervise(**kwargs):
+    """Exercise the product supervisor against this file's disposable fence."""
+
+    kwargs.setdefault("fence_config", _TEST_FENCE)
+    kwargs.setdefault("prove_claim", lambda: True)
+    return _supervise(**kwargs)
 
 
 SECRET = "sk-test-do-not-leak"
@@ -95,6 +225,9 @@ def _job(deadline_ns, **overrides):
         "timeout_seconds": 1,
         "socket_port": None,
         "ready_path": None,
+        "fence_path": _TEST_FENCE.path,
+        "fence_device": _TEST_FENCE.device,
+        "fence_inode": _TEST_FENCE.inode,
     }
     job.update(overrides)
     return job
@@ -103,10 +236,19 @@ def _job(deadline_ns, **overrides):
 class SupervisedProviderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        global _TEST_FENCE
         cls.session_stat = SESSION_FILE.stat()
+        _drop_published_fence()
+        directory = Path(tempfile.mkdtemp(prefix="m4s1-provider-fence-")).resolve()
+        os.chmod(directory, 0o700)
+        cls.fence_directory = directory
+        _TEST_FENCE = prepare_disposable_fence(directory / "provider.fence")
+        publish_shared_fence_config(_TEST_FENCE)
 
     @classmethod
     def tearDownClass(cls):
+        _drop_published_fence()
+        shutil.rmtree(cls.fence_directory, ignore_errors=True)
         current = SESSION_FILE.stat()
         if (
             current.st_ino != cls.session_stat.st_ino
@@ -116,6 +258,8 @@ class SupervisedProviderTests(unittest.TestCase):
             raise AssertionError("terminal session file changed")
         if PRODUCTION_DATABASE.exists():
             raise AssertionError("production database created")
+        if PRODUCTION_FENCE.exists():
+            raise AssertionError("production fence created")
 
     def test_worker_source_has_no_database_access(self):
         source = (SRC_ROOT / "provider_worker.py").read_text(encoding="utf-8")
@@ -469,12 +613,17 @@ class SupervisedProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             ready = Path(temporary) / "ready"
             started = time.monotonic()
-            process = spawn_worker(_job(
+            process = _spawn_fake_worker(_job(
                 time.monotonic_ns() + 1_500_000_000,
                 socket_port=server.getsockname()[1],
                 ready_path=str(ready),
             ))
             self.addCleanup(lambda: _ensure_dead(process))
+            self.assertTrue(_release_fake_locked_worker(
+                process,
+                time.monotonic_ns() + 1_500_000_000,
+                mode="fake",
+            ))
             _ready(ready, 2)
             code = process.wait(timeout=3)
         self.assertEqual(code, -9)
@@ -994,12 +1143,57 @@ def facts(operation_id):
 _LAUNCHER = """\
 import json
 import os
+import socket
+import subprocess
 import sys
 import time
-from provider_supervisor import spawn_worker
 job = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+if job.get("mode") != "fake" or type(job.get("fake")) is not str:
+    os._exit(2)
 job["parent_pid"] = os.getpid()
-process = spawn_worker(job)
+job["mode"] = "fake"
+parent, child = socket.socketpair()
+try:
+    child.set_inheritable(True)
+    payload = dict(job)
+    payload["control_fd"] = child.fileno()
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\\n"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "provider_worker"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+        pass_fds=(child.fileno(),),
+    )
+except Exception:
+    parent.close()
+    child.close()
+    os._exit(1)
+child.close()
+parent.set_inheritable(False)
+process.stdin.write(raw)
+process.stdin.close()
+control = parent
+control.settimeout(1)
+buffer = bytearray()
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline and b"\\n" not in buffer:
+    try:
+        chunk = control.recv(1024)
+    except TimeoutError:
+        continue
+    if not chunk:
+        os._exit(1)
+    buffer.extend(chunk)
+frame = json.loads(bytes(buffer).split(b"\\n", 1)[0].decode("utf-8"))
+if frame.get("type") != "locked" or frame.get("mode") != "fake":
+    os._exit(2)
+try:
+    control.sendall(b'{"type":"go"}\\n')
+except Exception:
+    os._exit(1)
 ready = job["ready_path"]
 deadline = time.monotonic() + 5
 while time.monotonic() < deadline and not os.path.exists(ready):
@@ -1200,6 +1394,10 @@ def _reap_worker(process):
 
 
 def _ensure_dead(process):
+    control = getattr(process, "_provider_control", None)
+    if control is not None:
+        process._provider_control = None
+        control.close()
     if process.poll() is None:
         _reap_worker(process)
     elif process.stdout is not None and not process.stdout.closed:
@@ -1231,6 +1429,8 @@ def _run(body, *, timeout=60):
             ),
             "PYTHONPATH": str(SRC_ROOT),
         }
+        for name in _FENCE_ENV:
+            environment.pop(name, None)
         return subprocess.run(
             (
                 sys.executable,
