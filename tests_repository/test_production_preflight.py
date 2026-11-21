@@ -1,4 +1,4 @@
-"""Read-only production preflight. The account conflict fails closed."""
+"""Read-only production preflight. Absent production prerequisites fail closed."""
 
 import os
 import pwd
@@ -30,7 +30,7 @@ _UNTOUCHED = (
 
 
 class ProductionPreflightTests(unittest.TestCase):
-    def test_account_path_mismatch_fails_closed_without_mutation(self):
+    def test_relocated_repository_fails_closed_without_mutation(self):
         before = {path: _metadata(path) for path in _UNTOUCHED}
         identity = pwd.getpwuid(os.geteuid())
         opened = []
@@ -52,13 +52,16 @@ class ProductionPreflightTests(unittest.TestCase):
         self.assertEqual(report.effective_user, identity.pw_name)
         self.assertEqual(report.process_home, identity.pw_dir)
         self.assertEqual(report.project_root, str(PROJECT_ROOT))
-        self.assertEqual(report.project_home, "/Users/Max")
+        self.assertEqual(report.project_home, "/Users/smart")
         self.assertEqual(
             report.pin_directory,
             "/Users/smart/Library/Application Support/MaxSmartTrust",
         )
         self.assertEqual(report.pin_home, "/Users/smart")
-        self.assertTrue(report.account_path_conflict)
+        self.assertFalse(report.account_path_conflict)
+        self.assertEqual(report.database_state, "absent")
+        self.assertEqual(report.marker_state, "absent")
+        self.assertEqual(report.temporary_marker_state, "absent")
         self.assertFalse(report.passed)
         self.assertEqual(report.filesystem_code, "local_apfs")
         self.assertEqual(report.git_code, "ignored")
@@ -78,6 +81,38 @@ class ProductionPreflightTests(unittest.TestCase):
         self.assertFalse(report.repository_symlink)
         self.assertFalse(stat.S_ISLNK(repository.st_mode))
         self.assertEqual(report.path_identity, "established")
+
+    def test_account_path_conflict_forces_failure(self):
+        root = _private_project()
+        self.addCleanup(shutil.rmtree, root, True)
+        data = root / "data"
+        data.mkdir(mode=0o700)
+        os.chmod(data, 0o700)
+        database = data / "max_smart.sqlite3"
+        _private_file(database)
+        _private_file(Path(f"{database}.initialization-state"))
+
+        def home(path):
+            if "MaxSmartTrust" in os.fspath(path):
+                return "/Users/smart"
+            return "/Users/Max"
+
+        with (
+            mock.patch("production_preflight._account_home", side_effect=home),
+            mock.patch("production_preflight.verify_local_apfs"),
+            mock.patch("production_preflight.verify_git_protection"),
+        ):
+            report = run_production_preflight(
+                project_root=root,
+                database_path=database,
+                pin_directory=Path(
+                    "/Users/smart/Library/Application Support/MaxSmartTrust"
+                ),
+            )
+        self.assertEqual(report.project_home, "/Users/Max")
+        self.assertEqual(report.pin_home, "/Users/smart")
+        self.assertTrue(report.account_path_conflict)
+        self.assertFalse(report.passed)
 
     def test_wrong_owner_mode_symlink_and_hard_link_fail_closed(self):
         root = _private_project()
