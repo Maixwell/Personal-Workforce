@@ -778,6 +778,12 @@ class RecoveryHelperTests(unittest.TestCase):
     def test_delegated_snapshot_reads_only_the_fixed_source(self):
         parameters = inspect.signature(create_delegated_recovery_snapshot).parameters
         self.assertNotIn("source", parameters)
+        self.assertEqual(
+            DELEGATED_SOURCE_PATH,
+            Path(
+                "/Users/smart/Projects/Personal Workforce/data/max_smart.sqlite3"
+            ),
+        )
         self.assertEqual(DELEGATED_SOURCE_PATH, PRODUCTION_DATABASE_PATH)
         self.assertFalse(PRODUCTION_DATABASE_PATH.exists())
         with self.assertRaises(RecoveryHelperError) as missing:

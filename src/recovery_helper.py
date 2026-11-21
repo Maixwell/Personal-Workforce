@@ -69,7 +69,9 @@ from provider_fence import PRODUCTION_FENCE_PATH, _APPROVED_PIN_DIRECTORY
 SIMULATED_RECOVERY_BOUNDARY = "simulated"
 OS_ENFORCED_RECOVERY_ISOLATION = False
 SEAL_VISIBILITY_IS_NOT_DURABILITY = True
-DELEGATED_SOURCE_PATH = PRODUCTION_DATABASE_PATH
+DELEGATED_SOURCE_PATH = Path(
+    "/Users/smart/Projects/Personal Workforce/data/max_smart.sqlite3"
+)
 _MANIFEST_FORMAT = "max-smart/recovery-manifest/v1"
 _HEAD_FORMAT = "max-smart/recovery-head/v1"
 _ACCEPTANCE_FORMAT = "max-smart/recovery-acceptance/v1"
