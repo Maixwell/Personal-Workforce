@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import plistlib
 import re
 import sqlite3
 import stat
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from .config import (
@@ -54,6 +56,23 @@ SQLITE_INITIALIZATION_INCOMPLETE = (
 SQLITE_INITIALIZATION_READY = b"max-smart/sqlite-init/v1 READY\n"
 _LOCAL_DISK_DEVICE = re.compile(r"disk[0-9]+(s[0-9]+)+")
 MINIMUM_SQLITE_VERSION = (3, 33, 0)
+_INITIALIZATION_CAPABILITY_TOKEN = object()
+_ACTIVE_INITIALIZATION_CAPABILITY = contextvars.ContextVar(
+    "max_smart_active_initialization_capability",
+    default=None,
+)
+
+
+@dataclass(frozen=True)
+class _InitializationCapability:
+    """One validated, descriptor-bound initialization target."""
+
+    database_path: Path
+    parent_descriptor: int
+    parent_device: int
+    parent_inode: int
+    policy: str
+    token: object
 
 
 class DatabaseSafetyError(RuntimeError):
@@ -754,7 +773,66 @@ def _create_marker_exclusively(path, contents):
                 )
 
 
+def _directory_identity_matches(status, expected_device, expected_inode):
+    return (
+        stat.S_ISDIR(status.st_mode)
+        and not stat.S_ISLNK(status.st_mode)
+        and stat.S_IMODE(status.st_mode) == 0o700
+        and status.st_uid == os.geteuid()
+        and (status.st_dev, status.st_ino) == (expected_device, expected_inode)
+    )
+
+
+def _fsync_retained_parent(capability, directory):
+    """Fsync the retained parent, then prove the path still names it."""
+
+    if Path(directory) != capability.database_path.parent:
+        raise DatabaseSafetyError(
+            "initialization_identity_changed",
+            "The initialization target identity changed.",
+        )
+    try:
+        held = os.fstat(capability.parent_descriptor)
+    except OSError as error:
+        raise DatabaseSafetyError(
+            "initialization_identity_changed",
+            "The initialization target identity changed.",
+        ) from error
+    if not _directory_identity_matches(
+        held,
+        capability.parent_device,
+        capability.parent_inode,
+    ):
+        raise DatabaseSafetyError(
+            "initialization_identity_changed",
+            "The initialization target identity changed.",
+        )
+    try:
+        os.fsync(capability.parent_descriptor)
+    except OSError as error:
+        raise DatabaseSafetyError(
+            "database_initialization_failed",
+            "The database directory could not be synchronized safely.",
+        ) from error
+    try:
+        named = Path(directory).lstat()
+    except OSError as error:
+        raise DatabaseSafetyError(
+            "initialization_identity_changed",
+            "The initialization target identity changed.",
+        ) from error
+    if not _directory_identity_matches(named, held.st_dev, held.st_ino):
+        raise DatabaseSafetyError(
+            "initialization_identity_changed",
+            "The initialization target identity changed.",
+        )
+
+
 def _fsync_directory(directory):
+    capability = _ACTIVE_INITIALIZATION_CAPABILITY.get()
+    if capability is not None:
+        _fsync_retained_parent(capability, directory)
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
@@ -799,6 +877,13 @@ def _check_initialization_candidate(database_path, *, production):
                 "path_symlink",
                 "The database path must not contain symbolic links.",
             )
+    _check_initialized_artifacts(database_path)
+
+
+def _check_initialized_artifacts(database_path):
+    """Verify initialized artifacts without selecting their path policy."""
+
+    database_path = Path(database_path)
     _check_private_directory(database_path.parent)
     _check_private_file(database_path, required=True)
     for suffix in SQLITE_SIDECAR_SUFFIXES:
@@ -811,94 +896,302 @@ def _check_initialization_candidate(database_path, *, production):
         raise _initialization_marker_error()
 
 
+def _open_initialization_capability(database_path, policy):
+    """Bind an already validated target to its current parent identity."""
+
+    parent = Path(database_path).parent
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(parent, flags)
+    except OSError as error:
+        raise DatabaseSafetyError(
+            "initialization_capability_unavailable",
+            "The initialization target identity could not be bound safely.",
+        ) from error
+    try:
+        status = os.fstat(descriptor)
+        named = parent.lstat()
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or stat.S_IMODE(status.st_mode) != 0o700
+            or status.st_uid != os.geteuid()
+            or stat.S_ISLNK(named.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or (status.st_dev, status.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise DatabaseSafetyError(
+                "initialization_capability_invalid",
+                "The initialization target identity is unsafe.",
+            )
+        return _InitializationCapability(
+            database_path=Path(database_path),
+            parent_descriptor=descriptor,
+            parent_device=status.st_dev,
+            parent_inode=status.st_ino,
+            policy=policy,
+            token=_INITIALIZATION_CAPABILITY_TOKEN,
+        )
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _disposable_production_initialization_capability(database_path):
+    """Return a production-semantics capability for an external test path.
+
+    This private test boundary cannot designate production or any repository
+    alias. It performs the real APFS and Git checks and does not create the
+    parent directory or any database artifact.
+    """
+
+    database_path = Path(database_path)
+    resolved = validate_test_database_path(database_path)
+    if resolved != database_path:
+        raise DatabaseSafetyError(
+            "path_symlink",
+            "The database path must not contain symbolic links.",
+        )
+    _check_private_directory(database_path.parent)
+    verify_local_apfs(database_path.parent)
+    verify_git_protection(PROJECT_ROOT)
+    return _open_initialization_capability(
+        database_path,
+        "disposable_production",
+    )
+
+
+def _production_initialization_capability(database_path):
+    """Return the fixed production capability; no alternate root is accepted."""
+
+    database_path = Path(database_path)
+    expected = PROJECT_ROOT / "data" / "max_smart.sqlite3"
+    if database_path != PRODUCTION_DATABASE_PATH or database_path != expected:
+        raise DatabaseSafetyError(
+            "production_path_mismatch",
+            "The production database path is not the approved fixed path.",
+        )
+    _assert_no_symlink(database_path, PROJECT_ROOT)
+    _check_private_directory(database_path.parent)
+    verify_local_apfs(database_path.parent)
+    verify_git_protection(PROJECT_ROOT)
+    return _open_initialization_capability(database_path, "production")
+
+
+def _test_initialization_capability(database_path):
+    """Bind the accepted ordinary disposable initialization path."""
+
+    database_path = Path(database_path)
+    resolved = validate_test_database_path(database_path)
+    if resolved != database_path:
+        raise DatabaseSafetyError(
+            "path_symlink",
+            "The database path must not contain symbolic links.",
+        )
+    _check_private_directory(database_path.parent)
+    return _open_initialization_capability(database_path, "test")
+
+
+def _revalidate_initialization_capability(capability):
+    """Prove the capability and its named parent still identify one directory."""
+
+    if (
+        type(capability) is not _InitializationCapability
+        or capability.token is not _INITIALIZATION_CAPABILITY_TOKEN
+        or capability.policy
+        not in {"production", "disposable_production", "test"}
+    ):
+        raise DatabaseSafetyError(
+            "initialization_capability_invalid",
+            "The initialization target capability is invalid.",
+        )
+    database_path = capability.database_path
+    try:
+        held = os.fstat(capability.parent_descriptor)
+        named = database_path.parent.lstat()
+    except OSError as error:
+        raise DatabaseSafetyError(
+            "initialization_identity_changed",
+            "The initialization target identity changed.",
+        ) from error
+    expected = (capability.parent_device, capability.parent_inode)
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or stat.S_IMODE(held.st_mode) != 0o700
+        or held.st_uid != os.geteuid()
+        or stat.S_ISLNK(named.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or stat.S_IMODE(named.st_mode) != 0o700
+        or named.st_uid != os.geteuid()
+        or (held.st_dev, held.st_ino) != expected
+        or (named.st_dev, named.st_ino) != expected
+    ):
+        raise DatabaseSafetyError(
+            "initialization_identity_changed",
+            "The initialization target identity changed.",
+        )
+    if capability.policy == "production":
+        expected_path = PROJECT_ROOT / "data" / "max_smart.sqlite3"
+        if (
+            database_path != PRODUCTION_DATABASE_PATH
+            or database_path != expected_path
+        ):
+            raise DatabaseSafetyError(
+                "production_path_mismatch",
+                "The production database path is not the approved fixed path.",
+            )
+        _assert_no_symlink(database_path, PROJECT_ROOT)
+        verify_local_apfs(database_path.parent)
+        verify_git_protection(PROJECT_ROOT)
+    else:
+        resolved = validate_test_database_path(database_path)
+        if resolved != database_path:
+            raise DatabaseSafetyError(
+                "path_symlink",
+                "The database path must not contain symbolic links.",
+            )
+        if capability.policy == "disposable_production":
+            verify_local_apfs(database_path.parent)
+            verify_git_protection(PROJECT_ROOT)
+    return database_path
+
+
+def _close_initialization_capability(capability, primary_exception):
+    try:
+        os.close(capability.parent_descriptor)
+    except OSError as cleanup_error:
+        if primary_exception is None:
+            raise DatabaseSafetyError(
+                "initialization_capability_close_failed",
+                "The initialization target capability could not be closed safely.",
+            ) from cleanup_error
+        if primary_exception.__cause__ is None:
+            primary_exception.__cause__ = cleanup_error
+        else:
+            primary_exception.add_note(
+                "Initialization capability cleanup also failed "
+                f"({type(cleanup_error).__name__}; details redacted)."
+            )
+
+
+def _initialize_sqlite_capability(capability):
+    """Initialize one capability-bound target using the accepted protocol.
+
+    sqlite3.connect and os.replace address files by path. Parent identity is
+    revalidated immediately before each of those calls. A replacement in the
+    remaining path-based interval cannot be eliminated because SQLite cannot
+    accept the retained parent descriptor.
+    """
+
+    primary_exception = None
+    capability_token = _ACTIVE_INITIALIZATION_CAPABILITY.set(capability)
+    try:
+        module_version = verify_sqlite_module_version()
+        database_path = _revalidate_initialization_capability(capability)
+        _refuse_existing_initialization_artifacts(database_path)
+        state_path = _initialization_state_path(database_path)
+        temporary_path = _initialization_temp_path(database_path)
+        old_umask = os.umask(0o077)
+        try:
+            database_path = _revalidate_initialization_capability(capability)
+            _create_marker_exclusively(
+                state_path,
+                SQLITE_INITIALIZATION_INCOMPLETE,
+            )
+            _fsync_directory(database_path.parent)
+            database_path = _revalidate_initialization_capability(capability)
+            _create_sqlite_file_exclusively(database_path)
+            if any(
+                _lstat_or_none(Path(f"{database_path}{suffix}")) is not None
+                for suffix in SQLITE_SIDECAR_SUFFIXES
+            ):
+                raise DatabaseSafetyError(
+                    "database_initialization_artifact_exists",
+                    "Database initialization requires unused artifact paths.",
+                )
+            database_path = _revalidate_initialization_capability(capability)
+            connection = sqlite3.connect(
+                f"{database_path.as_uri()}?mode=rw",
+                timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+                uri=True,
+            )
+            try:
+                verify_sqlite_connection_version(connection, module_version)
+                connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("PRAGMA legacy_alter_table=OFF")
+                journal_mode = connection.execute(
+                    "PRAGMA journal_mode=WAL"
+                ).fetchone()[0]
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute(
+                    f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}"
+                )
+                connection.execute("PRAGMA recursive_triggers=ON")
+                if journal_mode.lower() != "wal":
+                    raise DatabaseSafetyError(
+                        "wal_not_enabled",
+                        "SQLite WAL mode could not be enabled.",
+                    )
+                verify_required_sqlite_pragmas(connection)
+            except BaseException as connection_error:
+                close_owned_resource(connection, connection_error)
+                raise
+            else:
+                connection.close()
+            database_path = _revalidate_initialization_capability(capability)
+            secure_sqlite_artifacts(database_path)
+            _check_initialized_artifacts(database_path)
+            database_path = _revalidate_initialization_capability(capability)
+            _create_marker_exclusively(
+                temporary_path,
+                SQLITE_INITIALIZATION_READY,
+            )
+            _check_marker_exact(
+                temporary_path,
+                SQLITE_INITIALIZATION_READY,
+            )
+            _fsync_directory(database_path.parent)
+        finally:
+            os.umask(old_umask)
+        database_path = _revalidate_initialization_capability(capability)
+        try:
+            os.replace(temporary_path, state_path)
+        except OSError as error:
+            raise DatabaseSafetyError(
+                "database_initialization_failed",
+                "The database initialization state could not be committed.",
+            ) from error
+        try:
+            _fsync_directory(database_path.parent)
+        except BaseException as error:
+            raise DatabaseSafetyError(
+                "database_initialization_commit_uncertain",
+                "Database initialization committed but durability is uncertain.",
+            ) from error
+    except BaseException as error:
+        primary_exception = error
+        raise
+    finally:
+        _ACTIVE_INITIALIZATION_CAPABILITY.reset(capability_token)
+        _close_initialization_capability(capability, primary_exception)
+
+
 def initialize_sqlite_file(database_path, *, production=False):
     """Explicitly initialize WAL/pragmas; callers authorize file creation."""
-    module_version = verify_sqlite_module_version()
+
     database_path = Path(database_path)
     if production:
         prepare_production_database_directory(database_path)
+        capability = _production_initialization_capability(database_path)
     else:
         database_path = validate_test_database_path(database_path)
         database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _check_private_directory(database_path.parent)
-
-    _refuse_existing_initialization_artifacts(database_path)
-    state_path = _initialization_state_path(database_path)
-    temporary_path = _initialization_temp_path(database_path)
-    old_umask = os.umask(0o077)
-    try:
-        _create_marker_exclusively(
-            state_path,
-            SQLITE_INITIALIZATION_INCOMPLETE,
-        )
-        _fsync_directory(database_path.parent)
-        _create_sqlite_file_exclusively(database_path)
-        if any(
-            _lstat_or_none(Path(f"{database_path}{suffix}")) is not None
-            for suffix in SQLITE_SIDECAR_SUFFIXES
-        ):
-            raise DatabaseSafetyError(
-                "database_initialization_artifact_exists",
-                "Database initialization requires unused artifact paths.",
-            )
-        connection = sqlite3.connect(
-            f"{database_path.as_uri()}?mode=rw",
-            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
-            uri=True,
-        )
-        try:
-            verify_sqlite_connection_version(connection, module_version)
-            connection.execute("PRAGMA foreign_keys=ON")
-            connection.execute("PRAGMA legacy_alter_table=OFF")
-            journal_mode = connection.execute(
-                "PRAGMA journal_mode=WAL"
-            ).fetchone()[0]
-            connection.execute("PRAGMA synchronous=FULL")
-            connection.execute(
-                f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}"
-            )
-            connection.execute("PRAGMA recursive_triggers=ON")
-            if journal_mode.lower() != "wal":
-                raise DatabaseSafetyError(
-                    "wal_not_enabled",
-                    "SQLite WAL mode could not be enabled.",
-                )
-            verify_required_sqlite_pragmas(connection)
-        except BaseException as primary_exception:
-            close_owned_resource(connection, primary_exception)
-            raise
-        else:
-            connection.close()
-        secure_sqlite_artifacts(database_path)
-        _check_initialization_candidate(
-            database_path,
-            production=production,
-        )
-        if production:
-            verify_local_apfs(database_path.parent)
-            verify_git_protection(PROJECT_ROOT)
-        _create_marker_exclusively(
-            temporary_path,
-            SQLITE_INITIALIZATION_READY,
-        )
-        _check_marker_exact(
-            temporary_path,
-            SQLITE_INITIALIZATION_READY,
-        )
-        _fsync_directory(database_path.parent)
-    finally:
-        os.umask(old_umask)
-    try:
-        os.replace(temporary_path, state_path)
-    except OSError as error:
-        raise DatabaseSafetyError(
-            "database_initialization_failed",
-            "The database initialization state could not be committed.",
-        ) from error
-    try:
-        _fsync_directory(database_path.parent)
-    except BaseException as error:
-        raise DatabaseSafetyError(
-            "database_initialization_commit_uncertain",
-            "Database initialization committed but durability is uncertain.",
-        ) from error
+        capability = _test_initialization_capability(database_path)
+    return _initialize_sqlite_capability(capability)
