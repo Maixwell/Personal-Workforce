@@ -8,6 +8,7 @@ production key, or open production resources.
 import errno
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import shutil
@@ -34,10 +35,12 @@ from provider_fence import (  # noqa: E402
 )
 from provisioning_rehearsal import disposable_rehearsal_root  # noqa: E402
 from recovery_helper import (  # noqa: E402
+    DELEGATED_SOURCE_PATH,
     OS_ENFORCED_RECOVERY_ISOLATION,
     SEAL_VISIBILITY_IS_NOT_DURABILITY,
     SIMULATED_RECOVERY_BOUNDARY,
     RecoveryHelperError,
+    create_delegated_recovery_snapshot,
     create_recovery_snapshot,
     restore_recovery_point,
     verify_recovery_point,
@@ -189,6 +192,8 @@ class RecoveryHelperTests(unittest.TestCase):
         self.assertFalse(Path(f"{database}-wal").exists())
         self.assertFalse(Path(f"{database}-shm").exists())
         self.assertFalse(Path(f"{database}-journal").exists())
+        with database.open("rb") as handle:
+            self.assertEqual(handle.read(20)[18], 1)
         quarantine = self._quarantine()
         restored = self._restore(quarantine)
         self.assertEqual(restored, point)
@@ -651,6 +656,462 @@ class RecoveryHelperTests(unittest.TestCase):
             self._verify()
         self.assertEqual(missing.exception.code, "recovery_manifest_invalid")
         self._assert_production_absent()
+
+
+    def _source_digest(self, source):
+        digest = {}
+        candidates = [source, Path(f"{source}.initialization-state")]
+        for suffix in ("-wal", "-shm", "-journal", ".initialization-state.tmp"):
+            candidates.append(Path(f"{source}{suffix}"))
+        for candidate in candidates:
+            if candidate.exists() and not candidate.is_symlink():
+                digest[candidate.name] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            elif candidate.is_symlink():
+                digest[candidate.name] = "symlink"
+        return digest
+
+    def _delegated_values(self, source, **overrides):
+        listed = source.lstat()
+        values = {
+            "source_identity": self.source_identity,
+            "store_identity": self.store_identity,
+            "expected_owner_uid": listed.st_uid,
+            "expected_device": listed.st_dev,
+            "expected_inode": listed.st_ino,
+        }
+        values.update(overrides)
+        return values
+
+    def _as_recovery_reader(self, source):
+        return (
+            mock.patch("recovery_helper.DELEGATED_SOURCE_PATH", Path(source)),
+            mock.patch(
+                "recovery_helper._delegated_runtime_uid",
+                return_value=source.lstat().st_uid + 1,
+            ),
+            mock.patch(
+                "recovery_helper.os.open",
+                side_effect=self._read_only_source_open(source),
+            ),
+        )
+
+    def _source_artifacts(self, source):
+        return (
+            Path(source),
+            Path(f"{source}.initialization-state"),
+            Path(f"{source}-wal"),
+            Path(f"{source}-shm"),
+        )
+
+    def _read_only_source_open(self, source, writable=()):
+        real_open = os.open
+        probe = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+        protected = {path for path in self._source_artifacts(source) if path.exists()}
+        writable = {Path(path) for path in writable}
+
+        def guarded(path, flags, *args, **kwargs):
+            candidate = Path(path)
+            if candidate in protected and flags == probe:
+                if candidate in writable:
+                    return real_open(path, flags, *args, **kwargs)
+                raise PermissionError(errno.EACCES, "read-only delegated source")
+            return real_open(path, flags, *args, **kwargs)
+
+        return guarded
+
+    def _delegated_snapshot(self, source=None, **overrides):
+        source = self.source if source is None else source
+        with mock.patch("recovery_helper.DELEGATED_SOURCE_PATH", Path(source)), mock.patch(
+            "recovery_helper._delegated_runtime_uid",
+            return_value=source.lstat().st_uid + 1,
+        ), mock.patch(
+            "recovery_helper.os.open",
+            side_effect=self._read_only_source_open(source),
+        ):
+            return create_delegated_recovery_snapshot(
+                self.store,
+                self.key,
+                **self._delegated_values(source, **overrides),
+            )
+
+    def test_delete_mode_snapshot_is_one_consistent_file(self):
+        point = self._snapshot()
+        database = self.store / "generations" / "000001" / "database.sqlite3"
+        with database.open("rb") as handle:
+            self.assertEqual(handle.read(20)[18], 1)
+        self.assertFalse(list(database.parent.glob("database.sqlite3-*")))
+        connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
+        try:
+            self.assertEqual(
+                connection.execute("PRAGMA journal_mode").fetchone()[0],
+                "delete",
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA integrity_check").fetchone()[0],
+                "ok",
+            )
+        finally:
+            connection.close()
+        self.assertEqual(self._verify(), point)
+        self._assert_production_absent()
+
+    def test_nonempty_snapshot_sidecar_is_refused_without_deletion(self):
+        real = recovery_helper._snapshot_database
+        planted = []
+
+        def plant(*args, **kwargs):
+            result = real(*args, **kwargs)
+            sidecar = Path(f"{args[2]}-shm")
+            sidecar.write_bytes(b"planted-sidecar")
+            os.chmod(sidecar, 0o600)
+            planted.append(sidecar)
+            return result
+
+        with mock.patch("recovery_helper._snapshot_database", side_effect=plant):
+            with self.assertRaises(RecoveryHelperError) as refused:
+                self._snapshot()
+        self.assertEqual(refused.exception.code, "recovery_interrupted")
+        self.assertEqual(planted[0].read_bytes(), b"planted-sidecar")
+        self.assertFalse((self.store / "head.json").exists())
+        self._assert_production_absent()
+
+    def test_delegated_snapshot_reads_only_the_fixed_source(self):
+        parameters = inspect.signature(create_delegated_recovery_snapshot).parameters
+        self.assertNotIn("source", parameters)
+        self.assertEqual(DELEGATED_SOURCE_PATH, PRODUCTION_DATABASE_PATH)
+        self.assertFalse(PRODUCTION_DATABASE_PATH.exists())
+        with self.assertRaises(RecoveryHelperError) as missing:
+            create_delegated_recovery_snapshot(
+                self.store,
+                self.key,
+                source_identity=self.source_identity,
+                store_identity=self.store_identity,
+                expected_owner_uid=os.geteuid(),
+                expected_device=1,
+                expected_inode=1,
+            )
+        self.assertEqual(missing.exception.code, "recovery_source_missing")
+        self.assertFalse(PRODUCTION_DATABASE_PATH.exists())
+        self.assertFalse((self.store / "head.json").exists())
+        with mock.patch(
+            "recovery_helper.DELEGATED_SOURCE_PATH",
+            Path("relative.sqlite3"),
+        ):
+            with self.assertRaises(RecoveryHelperError) as relative:
+                create_delegated_recovery_snapshot(
+                    self.store,
+                    self.key,
+                    **self._delegated_values(self.source),
+                )
+        self.assertEqual(relative.exception.code, "recovery_path_refused")
+        connection = sqlite3.connect(self.source)
+        try:
+            connection.execute("INSERT INTO items(value) VALUES (2)")
+            connection.commit()
+            connection.execute("INSERT INTO items(value) VALUES (99)")
+            before = self._source_digest(self.source)
+            point = self._delegated_snapshot()
+            self.assertEqual(self._source_digest(self.source), before)
+        finally:
+            connection.close()
+        self.assertEqual(point.generation, 1)
+        database = self.store / "generations" / "000001" / "database.sqlite3"
+        self.assertEqual(_rows(database), [(1,), (2,)])
+        with database.open("rb") as handle:
+            self.assertEqual(handle.read(20)[18], 1)
+        self.assertFalse(list(database.parent.glob("database.sqlite3-*")))
+        self.assertEqual(self._verify(), point)
+        self._assert_production_absent()
+
+    def test_delegated_identity_and_write_capability_are_refused(self):
+        listed = self.source.lstat()
+        before = self._source_digest(self.source)
+        with mock.patch("recovery_helper.DELEGATED_SOURCE_PATH", self.source):
+            with self.assertRaises(RecoveryHelperError) as owned:
+                create_delegated_recovery_snapshot(
+                    self.store,
+                    self.key,
+                    **self._delegated_values(self.source),
+                )
+            self.assertEqual(owned.exception.code, "recovery_owner")
+            with self.assertRaises(RecoveryHelperError) as wrong_owner:
+                create_delegated_recovery_snapshot(
+                    self.store,
+                    self.key,
+                    **self._delegated_values(
+                        self.source,
+                        expected_owner_uid=listed.st_uid + 1,
+                    ),
+                )
+            self.assertEqual(wrong_owner.exception.code, "recovery_owner")
+            for name, value in (
+                ("expected_device", listed.st_dev + 1),
+                ("expected_inode", listed.st_ino + 1),
+            ):
+                with self.assertRaises(RecoveryHelperError) as mismatch:
+                    create_delegated_recovery_snapshot(
+                        self.store,
+                        self.key,
+                        **self._delegated_values(self.source, **{name: value}),
+                    )
+                self.assertEqual(mismatch.exception.code, "recovery_identity")
+        with mock.patch("recovery_helper.DELEGATED_SOURCE_PATH", self.source), mock.patch(
+            "recovery_helper._delegated_runtime_uid",
+            return_value=listed.st_uid + 1,
+        ):
+            with self.assertRaises(RecoveryHelperError) as writable:
+                create_delegated_recovery_snapshot(
+                    self.store,
+                    self.key,
+                    **self._delegated_values(self.source),
+                )
+        self.assertEqual(writable.exception.code, "recovery_permissions")
+        for bad in (None, True, -1, 1.5, "501"):
+            with self.assertRaises(RecoveryHelperError) as invalid:
+                create_delegated_recovery_snapshot(
+                    self.store,
+                    self.key,
+                    **self._delegated_values(self.source, expected_owner_uid=bad),
+                )
+            self.assertEqual(invalid.exception.code, "recovery_identity_invalid")
+        with self.assertRaises(TypeError):
+            create_delegated_recovery_snapshot(
+                self.store,
+                self.key,
+                source_identity=self.source_identity,
+                store_identity=self.store_identity,
+            )
+        self.assertEqual(self._source_digest(self.source), before)
+        self.assertFalse((self.store / "head.json").exists())
+        self._assert_production_absent()
+
+    def test_delegated_source_structure_failures_leave_the_source_in_place(self):
+        listed = self.source.lstat()
+        link = self.root / "source-hard-link.sqlite3"
+        os.link(self.source, link)
+        try:
+            with mock.patch("recovery_helper.DELEGATED_SOURCE_PATH", self.source):
+                with self.assertRaises(RecoveryHelperError) as linked:
+                    create_delegated_recovery_snapshot(
+                        self.store,
+                        self.key,
+                        **self._delegated_values(self.source),
+                    )
+            self.assertEqual(linked.exception.code, "recovery_identity")
+            self.assertEqual(self.source.lstat().st_nlink, 2)
+        finally:
+            link.unlink()
+        alias = self.root / "source-symlink.sqlite3"
+        alias.symlink_to(self.source)
+        with mock.patch("recovery_helper.DELEGATED_SOURCE_PATH", alias):
+            with self.assertRaises(RecoveryHelperError) as symlink:
+                create_delegated_recovery_snapshot(
+                    self.store,
+                    self.key,
+                    **self._delegated_values(self.source, expected_inode=alias.lstat().st_ino),
+                )
+        self.assertEqual(symlink.exception.code, "recovery_symlink")
+        self.assertTrue(alias.is_symlink())
+        os.chmod(self.source, 0o644)
+        try:
+            with mock.patch("recovery_helper.DELEGATED_SOURCE_PATH", self.source):
+                with self.assertRaises(RecoveryHelperError) as mode:
+                    create_delegated_recovery_snapshot(
+                        self.store,
+                        self.key,
+                        **self._delegated_values(self.source),
+                    )
+            self.assertEqual(mode.exception.code, "recovery_permissions")
+        finally:
+            os.chmod(self.source, 0o600)
+        marker = Path(f"{self.source}.initialization-state")
+        original = marker.read_bytes()
+        marker.write_bytes(b"max-smart/sqlite-init/v1 OTHER\n")
+        os.chmod(marker, 0o600)
+        try:
+            patches = self._as_recovery_reader(self.source)
+            with patches[0], patches[1], patches[2]:
+                with self.assertRaises(RecoveryHelperError) as mismatched:
+                    create_delegated_recovery_snapshot(
+                        self.store,
+                        self.key,
+                        **self._delegated_values(self.source),
+                    )
+            self.assertEqual(mismatched.exception.code, "recovery_marker_invalid")
+        finally:
+            marker.write_bytes(original)
+            os.chmod(marker, 0o600)
+        marker.rename(self.root / "saved-marker")
+        try:
+            patches = self._as_recovery_reader(self.source)
+            with patches[0], patches[1], patches[2]:
+                with self.assertRaises(RecoveryHelperError) as absent:
+                    create_delegated_recovery_snapshot(
+                        self.store,
+                        self.key,
+                        **self._delegated_values(self.source),
+                    )
+            self.assertEqual(absent.exception.code, "recovery_marker_invalid")
+        finally:
+            (self.root / "saved-marker").rename(marker)
+            os.chmod(marker, 0o600)
+        journal = Path(f"{self.source}-journal")
+        journal.write_bytes(b"planted-journal")
+        os.chmod(journal, 0o600)
+        try:
+            patches = self._as_recovery_reader(self.source)
+            with patches[0], patches[1], patches[2]:
+                with self.assertRaises(RecoveryHelperError) as planted:
+                    create_delegated_recovery_snapshot(
+                        self.store,
+                        self.key,
+                        **self._delegated_values(self.source),
+                    )
+            self.assertEqual(planted.exception.code, "recovery_sidecar_rejected")
+            self.assertEqual(journal.read_bytes(), b"planted-journal")
+        finally:
+            journal.unlink()
+        wal = Path(f"{self.source}-wal")
+        shm = Path(f"{self.source}-shm")
+        created_wal = False
+        if not wal.exists():
+            wal.write_bytes(b"")
+            os.chmod(wal, 0o600)
+            created_wal = True
+        removed_shm = shm.exists()
+        shm_bytes = shm.read_bytes() if removed_shm else None
+        if removed_shm:
+            shm.unlink()
+        try:
+            patches = self._as_recovery_reader(self.source)
+            with patches[0], patches[1], patches[2]:
+                with self.assertRaises(RecoveryHelperError) as missing_shm:
+                    create_delegated_recovery_snapshot(
+                        self.store,
+                        self.key,
+                        **self._delegated_values(self.source),
+                    )
+            self.assertEqual(missing_shm.exception.code, "recovery_sidecar_rejected")
+            self.assertFalse(shm.exists())
+        finally:
+            if created_wal and wal.exists():
+                wal.unlink()
+            if removed_shm and shm_bytes is not None and not shm.exists():
+                shm.write_bytes(shm_bytes)
+                os.chmod(shm, 0o600)
+        shm = Path(f"{self.source}-shm")
+        if shm.exists():
+            os.chmod(shm, 0o644)
+            try:
+                patches = self._as_recovery_reader(self.source)
+                with patches[0], patches[1], patches[2]:
+                    with self.assertRaises(RecoveryHelperError) as unsafe_shm:
+                        create_delegated_recovery_snapshot(
+                            self.store,
+                            self.key,
+                            **self._delegated_values(self.source),
+                        )
+                self.assertEqual(unsafe_shm.exception.code, "recovery_sidecar_rejected")
+            finally:
+                os.chmod(shm, 0o600)
+        self.assertFalse((self.store / "head.json").exists())
+        self.assertEqual(self.source.lstat().st_ino, listed.st_ino)
+        self._assert_production_absent()
+
+
+
+    def test_delegated_write_denial_covers_every_existing_artifact(self):
+        artifacts = {
+            "main": self.source,
+            "marker": Path(f"{self.source}.initialization-state"),
+            "wal": Path(f"{self.source}-wal"),
+            "shm": Path(f"{self.source}-shm"),
+        }
+        for path in (artifacts["wal"], artifacts["shm"]):
+            if not path.exists():
+                path.write_bytes(b"")
+                os.chmod(path, 0o600)
+        for name, allowed in artifacts.items():
+            with self.subTest(artifact=name):
+                with mock.patch(
+                    "recovery_helper.DELEGATED_SOURCE_PATH",
+                    self.source,
+                ), mock.patch(
+                    "recovery_helper._delegated_runtime_uid",
+                    return_value=self.source.lstat().st_uid + 1,
+                ), mock.patch(
+                    "recovery_helper.os.open",
+                    side_effect=self._read_only_source_open(
+                        self.source,
+                        writable=(allowed,),
+                    ),
+                ), mock.patch(
+                    "recovery_helper.sqlite3.connect",
+                    side_effect=AssertionError("sqlite opened"),
+                ):
+                    with self.assertRaises(RecoveryHelperError) as refused:
+                        create_delegated_recovery_snapshot(
+                            self.store,
+                            self.key,
+                            **self._delegated_values(self.source),
+                        )
+                self.assertEqual(refused.exception.code, "recovery_permissions")
+                self.assertFalse((self.store / "head.json").exists())
+        self._assert_production_absent()
+
+    def test_delegated_source_replacement_and_mutation_are_refused(self):
+        real = recovery_helper._snapshot_database
+        holder = sqlite3.connect(self.source)
+        holder.execute("BEGIN")
+        holder.execute("INSERT INTO items(value) VALUES (99)")
+        self.addCleanup(holder.close)
+
+        def replace_inode(*args, **kwargs):
+            result = real(*args, **kwargs)
+            replacement = self.root / "replacement.sqlite3"
+            replacement.write_bytes(self.source.read_bytes())
+            os.chmod(replacement, 0o600)
+            os.replace(replacement, self.source)
+            return result
+
+        with mock.patch(
+            "recovery_helper._snapshot_database",
+            side_effect=replace_inode,
+        ):
+            with self.assertRaises(RecoveryHelperError) as replaced:
+                self._delegated_snapshot()
+        self.assertEqual(replaced.exception.code, "recovery_identity")
+        self.assertTrue(self.source.exists())
+        self.assertFalse((self.store / "head.json").exists())
+        shutil.rmtree(self.store)
+        self.store = _private(self.root / "store")
+        self.source = self.root / "source.sqlite3"
+        if not self.source.exists():
+            self.fail("replacement removed the delegated source")
+
+        def mutate_content(*args, **kwargs):
+            result = real(*args, **kwargs)
+            descriptor = os.open(
+                self.source,
+                os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW,
+            )
+            try:
+                os.write(descriptor, b"x")
+            finally:
+                os.close(descriptor)
+            return result
+
+        with mock.patch(
+            "recovery_helper._snapshot_database",
+            side_effect=mutate_content,
+        ):
+            with self.assertRaises(RecoveryHelperError) as mutated:
+                self._delegated_snapshot()
+        self.assertEqual(mutated.exception.code, "recovery_identity")
+        self.assertFalse((self.store / "head.json").exists())
+        self.assertTrue(self.source.read_bytes().endswith(b"x"))
+        self._assert_production_absent()
+
 
 
 if __name__ == "__main__":

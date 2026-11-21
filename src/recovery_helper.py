@@ -2,8 +2,10 @@
 
 This module creates SQLite-consistent snapshots, authenticates each snapshot
 and its manifest, and restores only into a fresh quarantine directory. It
-does not create accounts, install services, generate production keys, or open
-production resources.
+does not create accounts, install services, or generate production keys.
+The simulated API refuses production paths. The delegated API reads only the
+fixed DELEGATED_SOURCE_PATH constant, and only through a read-only SQLite
+connection.
 
 SIMULATED_RECOVERY_BOUNDARY is a test separation only. The process that
 supplies the key can forge a MAC, and it can replace an entire store with an
@@ -50,6 +52,9 @@ from max_smart_db.config import (
     SQLITE_BUSY_TIMEOUT_SECONDS,
 )
 from max_smart_db.safety import (
+    SQLITE_INITIALIZATION_READY,
+    SQLITE_INITIALIZATION_STATE_SUFFIX,
+    SQLITE_INITIALIZATION_TEMP_SUFFIX,
     SQLITE_SIDECAR_SUFFIXES,
     DatabaseSafetyError,
     _check_ready_initialization_marker,
@@ -64,6 +69,7 @@ from provider_fence import PRODUCTION_FENCE_PATH, _APPROVED_PIN_DIRECTORY
 SIMULATED_RECOVERY_BOUNDARY = "simulated"
 OS_ENFORCED_RECOVERY_ISOLATION = False
 SEAL_VISIBILITY_IS_NOT_DURABILITY = True
+DELEGATED_SOURCE_PATH = PRODUCTION_DATABASE_PATH
 _MANIFEST_FORMAT = "max-smart/recovery-manifest/v1"
 _HEAD_FORMAT = "max-smart/recovery-head/v1"
 _ACCEPTANCE_FORMAT = "max-smart/recovery-acceptance/v1"
@@ -218,6 +224,80 @@ def create_recovery_snapshot(
     source_hex = _identity_hex(source_identity)
     store_hex = _identity_hex(store_identity)
     source_path, source_status = _require_source(source)
+    return _publish_snapshot(
+        source_path,
+        source_status,
+        store,
+        key,
+        source_hex,
+        store_hex,
+        minimum_generation,
+    )
+
+
+def create_delegated_recovery_snapshot(
+    store,
+    key,
+    *,
+    source_identity,
+    store_identity,
+    expected_owner_uid,
+    expected_device,
+    expected_inode,
+    boundary=SIMULATED_RECOVERY_BOUNDARY,
+    minimum_generation=None,
+):
+    """Snapshot the fixed delegated source into an authenticated store.
+
+    The source path is DELEGATED_SOURCE_PATH. Callers supply the expected
+    owner, device, and inode from the trusted service, not from an
+    application socket. The simulated API remains the only path that accepts
+    a caller-supplied source, and that API continues to refuse production paths.
+    """
+
+    _require_boundary(boundary)
+    key = _require_key(key)
+    source_hex = _identity_hex(source_identity)
+    store_hex = _identity_hex(store_identity)
+    owner = _require_expected_integer(expected_owner_uid)
+    device = _require_expected_integer(expected_device)
+    inode = _require_expected_integer(expected_inode)
+    source_path, source_status, source_inventory = _require_delegated_source(
+        owner,
+        device,
+        inode,
+    )
+    return _publish_snapshot(
+        source_path,
+        source_status,
+        store,
+        key,
+        source_hex,
+        store_hex,
+        minimum_generation,
+        source_owner=owner,
+        source_device=device,
+        source_inode=inode,
+        source_inventory=source_inventory,
+    )
+
+
+def _publish_snapshot(
+    source_path,
+    source_status,
+    store,
+    key,
+    source_hex,
+    store_hex,
+    minimum_generation,
+    *,
+    source_owner=None,
+    source_device=None,
+    source_inode=None,
+    source_inventory=None,
+):
+    """Publish one already validated source through the accepted store protocol."""
+
     store_path = _require_directory(store)
     if source_path == store_path:
         _fail("path_refused")
@@ -257,7 +337,13 @@ def create_recovery_snapshot(
             source_status,
             temporary_path,
             temporary_status,
+            source_owner=source_owner,
+            source_device=source_device,
+            source_inode=source_inode,
+            source_inventory=source_inventory,
         )
+        if source_inventory is not None:
+            _require_delegated_inventory(source_path, source_inventory)
         _clear_empty_temp_sidecars(temporary_path)
         temporary_status = _fsync_file(
             temporary_path,
@@ -554,6 +640,272 @@ def _require_source(path):
     return candidate, listed
 
 
+def _delegated_runtime_uid():
+    """Return the uid that must not own the delegated source."""
+
+    return os.geteuid()
+
+
+def _require_expected_integer(value):
+    if type(value) is not int or isinstance(value, bool) or value < 0:
+        _fail("identity_invalid")
+    return value
+
+
+def _require_delegated_source(owner, device, inode):
+    candidate, listed = _delegated_fixed_path()
+    if stat.S_ISLNK(listed.st_mode):
+        _fail("symlink")
+    if not stat.S_ISREG(listed.st_mode) or listed.st_size <= 0:
+        _fail("source_invalid")
+    if stat.S_IMODE(listed.st_mode) != 0o600:
+        _fail("permissions")
+    if listed.st_nlink != 1:
+        _fail("identity")
+    if listed.st_uid != owner:
+        _fail("owner")
+    if listed.st_dev != device or listed.st_ino != inode:
+        _fail("identity")
+    if listed.st_uid == _delegated_runtime_uid():
+        _fail("owner")
+    _refuse_source_write(candidate)
+    _check_delegated_marker(candidate, owner)
+    _require_delegated_sidecars(candidate, owner)
+    current = candidate.lstat()
+    if (
+        current.st_dev != device
+        or current.st_ino != inode
+        or current.st_uid != owner
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or current.st_nlink != 1
+    ):
+        _fail("identity")
+    inventory = [
+        _seal_delegated_artifact(candidate, owner),
+        _seal_delegated_artifact(
+            Path(f"{candidate}{SQLITE_INITIALIZATION_STATE_SUFFIX}"),
+            owner,
+        ),
+    ]
+    for suffix in ("-wal", "-shm"):
+        artifact = Path(f"{candidate}{suffix}")
+        if _status_or_none(artifact) is not None:
+            inventory.append(_seal_delegated_artifact(artifact, owner))
+    return candidate, current, tuple(inventory)
+
+
+def _delegated_fixed_path():
+    path = DELEGATED_SOURCE_PATH
+    if not isinstance(path, Path) or not path.is_absolute():
+        _fail("path_refused")
+    if any(part in _CLOUD_PATH_COMPONENTS for part in path.parts):
+        _fail("filesystem")
+    current = Path(path.anchor)
+    parts = path.relative_to(path.anchor).parts
+    listed = None
+    for index, part in enumerate(parts):
+        current = current / part
+        leaf = index == len(parts) - 1
+        try:
+            listed = current.lstat()
+        except FileNotFoundError:
+            _fail("source_missing" if leaf else "path_refused")
+        except OSError:
+            _fail("identity")
+        if stat.S_ISLNK(listed.st_mode):
+            _fail("symlink")
+        if leaf and not stat.S_ISREG(listed.st_mode):
+            _fail("source_invalid")
+        if not leaf and not stat.S_ISDIR(listed.st_mode):
+            _fail("path_refused")
+    return path, listed
+
+
+def _refuse_source_write(path):
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM):
+            return
+        _fail("permissions")
+    try:
+        os.close(descriptor)
+    except OSError:
+        _fail("permissions")
+    _fail("permissions")
+
+
+def _check_delegated_marker(database, owner):
+    temporary = Path(f"{database}{SQLITE_INITIALIZATION_TEMP_SUFFIX}")
+    if _status_or_none(temporary) is not None:
+        _fail("marker_invalid")
+    marker = Path(f"{database}{SQLITE_INITIALIZATION_STATE_SUFFIX}")
+    try:
+        descriptor = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        _fail("marker_invalid")
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or stat.S_IMODE(status.st_mode) != 0o600
+            or status.st_uid != owner
+            or status.st_nlink != 1
+        ):
+            _fail("marker_invalid")
+        contents = os.read(descriptor, len(SQLITE_INITIALIZATION_READY) + 1)
+        if contents != SQLITE_INITIALIZATION_READY:
+            _fail("marker_invalid")
+    except OSError:
+        _fail("marker_invalid")
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            _fail("marker_invalid")
+
+
+def _require_delegated_sidecars(database, owner):
+    wal = _status_or_none(Path(f"{database}-wal"))
+    shm = _status_or_none(Path(f"{database}-shm"))
+    journal = _status_or_none(Path(f"{database}-journal"))
+    if journal is not None or (wal is not None and shm is None):
+        _fail("sidecar_rejected")
+    for status in (wal, shm):
+        if status is None:
+            continue
+        if (
+            stat.S_ISLNK(status.st_mode)
+            or not stat.S_ISREG(status.st_mode)
+            or status.st_uid != owner
+            or stat.S_IMODE(status.st_mode) != 0o600
+            or status.st_nlink != 1
+        ):
+            _fail("sidecar_rejected")
+
+
+def _seal_delegated_artifact(path, owner):
+    """Prove one source artifact is immutable before SQLite opens it."""
+
+    listed = path.lstat()
+    _refuse_source_write(path)
+    current = path.lstat()
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_dev != listed.st_dev
+        or current.st_ino != listed.st_ino
+        or current.st_uid != owner
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or current.st_nlink != 1
+        or current.st_size != listed.st_size
+    ):
+        _fail("identity")
+    return (
+        path.name,
+        current.st_dev,
+        current.st_ino,
+        current.st_uid,
+        stat.S_IMODE(current.st_mode),
+        current.st_nlink,
+        current.st_size,
+        _digest_delegated_artifact(path, current, owner),
+    )
+
+
+def _digest_delegated_artifact(path, listed, owner):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        _fail("identity")
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != listed.st_dev
+            or current.st_ino != listed.st_ino
+            or current.st_uid != owner
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or current.st_nlink != 1
+            or current.st_size != listed.st_size
+        ):
+            _fail("identity")
+        hasher = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            total += len(chunk)
+        if total != current.st_size:
+            _fail("identity")
+        return hasher.hexdigest()
+    except OSError:
+        _fail("identity")
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            _fail("identity")
+
+
+def _require_delegated_inventory(database, inventory):
+    actual = _delegated_dependency_names(database)
+    expected = {item[0] for item in inventory}
+    if actual != expected:
+        _fail("sidecar_rejected")
+    parent = database.parent
+    for name, device, inode, owner, mode, links, size, digest in inventory:
+        path = parent / name
+        try:
+            listed = path.lstat()
+        except OSError:
+            _fail("identity")
+        if stat.S_ISLNK(listed.st_mode):
+            _fail("symlink")
+        if (
+            not stat.S_ISREG(listed.st_mode)
+            or listed.st_dev != device
+            or listed.st_ino != inode
+            or listed.st_uid != owner
+            or stat.S_IMODE(listed.st_mode) != mode
+            or listed.st_nlink != links
+            or listed.st_size != size
+        ):
+            _fail("identity")
+        if _digest_delegated_artifact(path, listed, owner) != digest:
+            _fail("identity")
+
+
+def _delegated_dependency_names(path):
+    names = {
+        path.name,
+        f"{path.name}{SQLITE_INITIALIZATION_STATE_SUFFIX}",
+        f"{path.name}{SQLITE_INITIALIZATION_TEMP_SUFFIX}",
+    }
+    names.update(f"{path.name}{suffix}" for suffix in SQLITE_SIDECAR_SUFFIXES)
+    return {
+        name
+        for name in names
+        if _status_or_none(path.parent / name) is not None
+    }
+
+
+def _recheck_delegated_source(path, expected, owner, device, inode):
+    current = _recheck(path, expected)
+    if (
+        current.st_uid != owner
+        or current.st_dev != device
+        or current.st_ino != inode
+        or current.st_nlink != 1
+    ):
+        _fail("identity")
+    return current
+
+
 def _require_directory(path):
     candidate, listed = _candidate(path, must_exist=True, directory=True)
     _require_private_directory_status(listed)
@@ -651,16 +1003,36 @@ def _create_temp(parent):
     return path, path.lstat()
 
 
-def _snapshot_database(source, source_status, temporary, temporary_status):
+def _snapshot_database(
+    source,
+    source_status,
+    temporary,
+    temporary_status,
+    *,
+    source_owner=None,
+    source_device=None,
+    source_inode=None,
+    source_inventory=None,
+):
     try:
         module_version = verify_sqlite_module_version()
     except DatabaseSafetyError as error:
         _map_safety(error)
     source_status = _recheck(source, source_status)
-    try:
-        _check_ready_initialization_marker(source)
-    except DatabaseSafetyError as error:
-        _map_safety(error)
+    if source_owner is None:
+        try:
+            _check_ready_initialization_marker(source)
+        except DatabaseSafetyError as error:
+            _map_safety(error)
+    else:
+        _recheck_delegated_source(
+            source,
+            source_status,
+            source_owner,
+            source_device,
+            source_inode,
+        )
+        _check_delegated_marker(source, source_owner)
     source_connection = _connect(source, readonly=True)
     target_connection = None
     try:
@@ -680,22 +1052,28 @@ def _snapshot_database(source, source_status, temporary, temporary_status):
         except sqlite3.OperationalError as error:
             _raise_sqlite(error)
         try:
-            target_connection.execute("PRAGMA synchronous=FULL")
+            _require_synchronous_full(target_connection)
             source_connection.backup(target_connection, pages=1, sleep=0.0)
-            journal = target_connection.execute(
-                "PRAGMA journal_mode=DELETE"
-            ).fetchone()
-            target_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            _require_pragma_text(
+                target_connection,
+                "PRAGMA locking_mode=EXCLUSIVE",
+                "exclusive",
+            )
+            _require_pragma_text(
+                target_connection,
+                "PRAGMA journal_mode=DELETE",
+                "delete",
+            )
+            _require_pragma_text(
+                target_connection,
+                "PRAGMA locking_mode=NORMAL",
+                "normal",
+            )
             _require_integrity(target_connection)
         except sqlite3.OperationalError as error:
             _raise_sqlite(error)
         except sqlite3.DatabaseError:
             _fail("integrity")
-        if (
-            not isinstance(journal, tuple)
-            or str(journal[0]).lower() != "delete"
-        ):
-            _fail("interrupted")
     finally:
         for connection in (target_connection, source_connection):
             if connection is not None:
@@ -704,7 +1082,39 @@ def _snapshot_database(source, source_status, temporary, temporary_status):
                 except sqlite3.Error:
                     pass
     _recheck(temporary, temporary_status)
+    if source_owner is not None:
+        _recheck_delegated_source(
+            source,
+            source_status,
+            source_owner,
+            source_device,
+            source_inode,
+        )
+        _require_delegated_inventory(source, source_inventory)
     return module_version
+
+
+def _require_synchronous_full(connection):
+    try:
+        connection.execute("PRAGMA synchronous=FULL")
+        row = connection.execute("PRAGMA synchronous").fetchone()
+    except sqlite3.OperationalError as error:
+        _raise_sqlite(error)
+    if not isinstance(row, tuple) or len(row) != 1 or row[0] != 2:
+        _fail("interrupted")
+
+
+def _require_pragma_text(connection, statement, expected):
+    try:
+        row = connection.execute(statement).fetchone()
+    except sqlite3.OperationalError as error:
+        _raise_sqlite(error)
+    if (
+        not isinstance(row, tuple)
+        or len(row) != 1
+        or str(row[0]).lower() != expected
+    ):
+        _fail("interrupted")
 
 
 def _connect(path, *, readonly):
