@@ -10,12 +10,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from application import (  # noqa: E402
+    AppliedTurn,
+    ConversationMessage,
     ConversationStateError,
     MaxSmartApplication,
+    ModelOutcome,
+    ModelOutcomeKind,
     ModelRequestError,
+    PreparedTurn,
     SessionSaveError,
     TurnResult,
     TurnStatus,
+    apply_model_outcome,
+    prepare_turn,
+    request_prepared,
 )
 
 
@@ -25,6 +33,250 @@ class MaxSmartApplicationTests(unittest.TestCase):
             request or Mock(return_value="reply"),
             save or Mock(),
             messages or [],
+        )
+
+    def test_prepare_builds_immutable_provider_neutral_input(self):
+        history = [{"role": "assistant", "content": "Earlier"}]
+
+        prepared = prepare_turn(history, "Hello")
+        history[0]["content"] = "mutated later"
+
+        self.assertEqual(
+            prepared,
+            PreparedTurn(
+                user_text="Hello",
+                base_messages=(
+                    ConversationMessage("assistant", "Earlier"),
+                ),
+                model_input=(
+                    ConversationMessage("assistant", "Earlier"),
+                    ConversationMessage("user", "Hello"),
+                ),
+            ),
+        )
+        request_messages = prepared.request_messages()
+        request_messages[0]["content"] = "provider mutated copy"
+        self.assertEqual(prepared.model_input[0].content, "Earlier")
+
+    def test_request_stage_calls_model_once_and_marks_unclassified_failure_uncertain(
+        self,
+    ):
+        prepared = prepare_turn([], "Hello")
+        request = Mock(side_effect=ModelRequestError("private detail"))
+
+        outcome = request_prepared(request, prepared)
+
+        self.assertEqual(
+            outcome,
+            ModelOutcome(ModelOutcomeKind.UNCERTAIN),
+        )
+        request.assert_called_once_with(
+            [{"role": "user", "content": "Hello"}]
+        )
+
+    def test_request_stage_propagates_unexpected_exception(self):
+        prepared = prepare_turn([], "Hello")
+        request = Mock(side_effect=TypeError("programming error"))
+
+        with self.assertRaisesRegex(TypeError, "programming error"):
+            request_prepared(request, prepared)
+
+        request.assert_called_once_with(
+            [{"role": "user", "content": "Hello"}]
+        )
+
+    def test_request_stage_maps_unusable_replies_to_definite_failure(self):
+        prepared = prepare_turn([], "Hello")
+
+        for reply in ("", None, 123):
+            with self.subTest(reply=reply):
+                request = Mock(return_value=reply)
+
+                outcome = request_prepared(request, prepared)
+
+                self.assertEqual(
+                    outcome,
+                    ModelOutcome(ModelOutcomeKind.DEFINITE_FAILURE),
+                )
+                self.assertEqual(
+                    apply_model_outcome(prepared, outcome),
+                    AppliedTurn(pending_message="Hello"),
+                )
+                request.assert_called_once_with(
+                    [{"role": "user", "content": "Hello"}]
+                )
+
+    def test_unusable_reply_becomes_pending_without_save_or_retry(self):
+        for reply in ("", None, 123):
+            with self.subTest(reply=reply):
+                request = Mock(return_value=reply)
+                save = Mock()
+                application = self.make_application(request, save)
+
+                result = application.submit_message("Hello")
+
+                self.assertEqual(
+                    result,
+                    TurnResult(TurnStatus.MODEL_REQUEST_FAILED),
+                )
+                request.assert_called_once_with(
+                    [{"role": "user", "content": "Hello"}]
+                )
+                save.assert_not_called()
+                self.assertEqual(application.messages, [])
+                self.assertTrue(application.has_pending_message)
+                self.assertFalse(application.has_unsaved_turn)
+
+    def test_model_outcome_rejects_success_without_usable_text(self):
+        for unusable in (None, "", " \t\n", 123):
+            with self.subTest(unusable=unusable):
+                with self.assertRaises(ValueError):
+                    ModelOutcome(ModelOutcomeKind.SUCCESS, unusable)
+
+    def test_model_outcome_rejects_failure_with_response_text(self):
+        for kind in (
+            ModelOutcomeKind.DEFINITE_FAILURE,
+            ModelOutcomeKind.UNCERTAIN,
+        ):
+            with self.subTest(kind=kind):
+                with self.assertRaises(ValueError):
+                    ModelOutcome(kind, "must not be present")
+
+    def test_apply_stage_produces_snapshot_without_persisting(self):
+        prepared = prepare_turn(
+            [{"role": "assistant", "content": "Earlier"}],
+            "Hello",
+        )
+
+        applied = apply_model_outcome(
+            prepared,
+            ModelOutcome(ModelOutcomeKind.SUCCESS, "Reply"),
+        )
+
+        self.assertEqual(
+            applied,
+            AppliedTurn(
+                proposed_messages=(
+                    ConversationMessage("assistant", "Earlier"),
+                    ConversationMessage("user", "Hello"),
+                    ConversationMessage("assistant", "Reply"),
+                ),
+                assistant_text="Reply",
+            ),
+        )
+        self.assertEqual(
+            applied.messages_to_save(),
+            [
+                {"role": "assistant", "content": "Earlier"},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Reply"},
+            ],
+        )
+
+    def test_apply_stage_maps_both_failure_kinds_to_same_pending_turn(self):
+        prepared = prepare_turn([], "Hello")
+
+        for kind in (
+            ModelOutcomeKind.DEFINITE_FAILURE,
+            ModelOutcomeKind.UNCERTAIN,
+        ):
+            with self.subTest(kind=kind):
+                applied = apply_model_outcome(prepared, ModelOutcome(kind))
+
+                self.assertEqual(
+                    applied,
+                    AppliedTurn(pending_message="Hello"),
+                )
+
+    def test_applied_turn_rejects_contradictory_states(self):
+        proposed = (
+            ConversationMessage("user", "Hello"),
+            ConversationMessage("assistant", "Reply"),
+        )
+
+        invalid_turns = (
+            {},
+            {
+                "pending_message": "Hello",
+                "proposed_messages": proposed,
+                "assistant_text": "Reply",
+            },
+            {"proposed_messages": proposed},
+            {"assistant_text": "Reply"},
+        )
+        for values in invalid_turns:
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    AppliedTurn(**values)
+
+    def test_pending_applied_turn_has_no_messages_to_save(self):
+        applied = AppliedTurn(pending_message="Hello")
+
+        with self.assertRaises(ConversationStateError):
+            applied.messages_to_save()
+
+    def test_prepare_normalizes_history_to_role_and_content(self):
+        prepared = prepare_turn(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Earlier",
+                    "timestamp": "2026-10-31T19:21:00+08:00",
+                }
+            ],
+            "Hello",
+        )
+
+        self.assertEqual(
+            prepared.request_messages(),
+            [
+                {"role": "assistant", "content": "Earlier"},
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+        applied = apply_model_outcome(
+            prepared,
+            ModelOutcome(ModelOutcomeKind.SUCCESS, "Reply"),
+        )
+        self.assertEqual(
+            applied.messages_to_save(),
+            [
+                {"role": "assistant", "content": "Earlier"},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Reply"},
+            ],
+        )
+
+    def test_submit_runs_request_before_single_persistence_attempt(self):
+        events = []
+
+        def request(model_input):
+            events.append(("request", model_input))
+            return "Reply"
+
+        def save(messages):
+            events.append(("save", messages))
+
+        application = self.make_application(request, save)
+
+        result = application.submit_message("Hello")
+
+        self.assertEqual(result, TurnResult(TurnStatus.SUCCESS, "Reply"))
+        self.assertEqual(
+            events,
+            [
+                (
+                    "request",
+                    [{"role": "user", "content": "Hello"}],
+                ),
+                (
+                    "save",
+                    [
+                        {"role": "user", "content": "Hello"},
+                        {"role": "assistant", "content": "Reply"},
+                    ],
+                ),
+            ],
         )
 
     def test_successful_first_submission_requests_and_saves_once(self):
