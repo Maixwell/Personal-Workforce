@@ -732,6 +732,8 @@ def _write_all(descriptor, contents):
 
 
 def _create_marker_exclusively(path, contents):
+    """Write and sync a new marker, then return its descriptor identity."""
+
     try:
         descriptor = os.open(
             path,
@@ -752,6 +754,7 @@ def _create_marker_exclusively(path, contents):
     try:
         _write_all(descriptor, contents)
         os.fsync(descriptor)
+        return os.fstat(descriptor)
     except BaseException as error:
         primary_exception = error
         raise

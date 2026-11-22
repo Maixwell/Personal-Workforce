@@ -1,12 +1,14 @@
 """Interface-independent conversation orchestration for Max Smart."""
 
+import json
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-Message = Dict[str, str]
-RequestModel = Callable[[List[Message]], str]
+Message = Dict[str, Any]
+RequestModel = Callable[[List[Dict[str, str]]], str]
 SaveMessages = Callable[[List[Message]], None]
 
 
@@ -31,10 +33,30 @@ class TurnStatus(Enum):
 
 @dataclass(frozen=True)
 class ConversationMessage:
-    """An immutable provider-neutral conversation message."""
+    """An immutable message with optional JSON fields from saved history."""
 
     role: str
     content: str
+    extra_fields_json: str = ""
+
+    @classmethod
+    def from_message(cls, message: Message) -> "ConversationMessage":
+        extra_fields = {
+            key: value
+            for key, value in message.items()
+            if key not in ("role", "content")
+        }
+        return cls(
+            message["role"],
+            message["content"],
+            json.dumps(extra_fields) if extra_fields else "",
+        )
+
+    def to_saved_message(self) -> Message:
+        message = {"role": self.role, "content": self.content}
+        if self.extra_fields_json:
+            message.update(json.loads(self.extra_fields_json))
+        return message
 
 
 @dataclass(frozen=True)
@@ -45,7 +67,7 @@ class PreparedTurn:
     base_messages: Tuple[ConversationMessage, ...]
     model_input: Tuple[ConversationMessage, ...]
 
-    def request_messages(self) -> List[Message]:
+    def request_messages(self) -> List[Dict[str, str]]:
         """Return a mutable copy suitable for a provider adapter."""
         return [
             {"role": message.role, "content": message.content}
@@ -107,10 +129,7 @@ class AppliedTurn:
         """Return a mutable copy of the proposed successful snapshot."""
         if self.proposed_messages is None:
             raise ConversationStateError("A pending turn has no snapshot to save.")
-        return [
-            {"role": message.role, "content": message.content}
-            for message in self.proposed_messages
-        ]
+        return [message.to_saved_message() for message in self.proposed_messages]
 
 
 @dataclass(frozen=True)
@@ -133,8 +152,7 @@ def prepare_turn(messages: List[Message], text: str) -> PreparedTurn:
         raise ValueError("Message text must be a non-blank string.")
 
     base_messages = tuple(
-        ConversationMessage(message["role"], message["content"])
-        for message in messages
+        ConversationMessage.from_message(message) for message in messages
     )
     user_message = ConversationMessage("user", text)
     return PreparedTurn(
@@ -272,4 +290,4 @@ class MaxSmartApplication:
 
     @staticmethod
     def _copy_messages(messages: List[Message]) -> List[Message]:
-        return [dict(message) for message in messages]
+        return deepcopy(messages)

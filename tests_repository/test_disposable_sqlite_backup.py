@@ -8,6 +8,7 @@ import errno
 import os
 import sqlite3
 import stat
+import subprocess
 import threading
 import unittest
 from pathlib import Path
@@ -292,6 +293,52 @@ class DisposableSqliteBackupTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         self._assert_production_absent()
 
+    def test_exclusive_lock_acquired_during_copy_times_out(self):
+        destination = self._destination()
+        real_snapshot = disposable_sqlite_backup._snapshot_database
+        holder = sqlite3.connect(self.source)
+
+        def acquire_lock(source, target, operation):
+            holder.execute("BEGIN EXCLUSIVE")
+            return real_snapshot(source, target, operation)
+
+        try:
+            holder.execute("PRAGMA journal_mode=DELETE")
+            with (
+                mock.patch.object(
+                    disposable_sqlite_backup, "SQLITE_BUSY_TIMEOUT_SECONDS", 0.15,
+                ),
+                mock.patch.object(
+                    disposable_sqlite_backup, "_snapshot_database", acquire_lock,
+                ),
+                self.assertRaises(DisposableBackupError) as busy,
+            ):
+                backup_disposable_sqlite(self.source, destination)
+        finally:
+            holder.close()
+        self.assertEqual(busy.exception.code, "backup_lock_contention")
+        self.assertFalse(destination.exists())
+        self._assert_no_temporary_names()
+
+    def test_temp_file_recheck_uses_the_created_descriptor_identity(self):
+        temporary = self.root / ".backup-test.sqlite3"
+        other = self.root / "other.sqlite3"
+        self._write_private(other, b"keep")
+        other_status = other.lstat()
+        real_lstat = Path.lstat
+
+        def observe(path):
+            return other_status if path == temporary else real_lstat(path)
+
+        with (
+            mock.patch.object(disposable_sqlite_backup.secrets, "token_hex", return_value="test"),
+            mock.patch.object(Path, "lstat", observe),
+            self.assertRaises(DisposableBackupError) as failed,
+        ):
+            disposable_sqlite_backup._create_temp(self.root, "backup", "backup")
+        self.assertEqual(failed.exception.code, "backup_identity")
+        self.assertEqual(other.read_bytes(), b"keep")
+
     def test_corrupt_backup_is_not_restored(self):
         backup = self._destination("backup.sqlite3")
         backup_disposable_sqlite(self.source, backup)
@@ -400,8 +447,51 @@ class DisposableSqliteBackupTests(unittest.TestCase):
         self.assertFalse(self._marker(destination).exists())
         restored = self._destination("restored.sqlite3")
         restore_disposable_sqlite(destination, restored)
-        self.assertEqual(_rows(restored), [(1,)])
+        self.assertEqual(self._marker(restored).read_bytes(), SQLITE_INITIALIZATION_READY)
+        script = """\
+import sys
+from django.conf import settings
+from max_smart_db.config import database_configuration
+
+settings.configure(
+    DATABASES={"default": database_configuration(sys.argv[1])},
+    MAX_SMART_DATABASE_KIND="test",
+    USE_TZ=True,
+)
+from django.db import connection
+
+try:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT value FROM items")
+        assert cursor.fetchall() == [(1,)]
+finally:
+    connection.close()
+"""
+        result = subprocess.run(
+            (sys.executable, "-B", "-c", script, str(restored)),
+            env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
         self._assert_production_absent()
+
+    def test_restore_leaves_no_ready_marker_if_main_durability_fails(self):
+        backup = self._destination("copy.sqlite3")
+        backup_disposable_sqlite(self.source, backup)
+        restored = self._destination("restored.sqlite3")
+        with mock.patch(
+            "disposable_sqlite_backup._fsync_directory",
+            side_effect=DisposableBackupError("restore_durability_uncertain"),
+        ):
+            with self.assertRaises(DisposableBackupError) as uncertain:
+                restore_disposable_sqlite(backup, restored)
+        self.assertEqual(uncertain.exception.code, "restore_durability_uncertain")
+        self.assertTrue(restored.is_file())
+        self.assertFalse(self._marker(restored).exists())
+        self._assert_no_temporary_names()
 
     def test_backup_refuses_missing_incomplete_invalid_and_unbound_markers(self):
         destination = self._destination()
@@ -487,9 +577,9 @@ class DisposableSqliteBackupTests(unittest.TestCase):
     def _plant_during_backup(self, sibling, payload):
         real_snapshot = disposable_sqlite_backup._snapshot_database
 
-        def plant(source_connection, target_connection):
+        def plant(source_connection, target_connection, operation):
             self._write_private(sibling, payload)
-            return real_snapshot(source_connection, target_connection)
+            return real_snapshot(source_connection, target_connection, operation)
 
         return mock.patch("disposable_sqlite_backup._snapshot_database", plant)
 

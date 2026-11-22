@@ -215,17 +215,15 @@ class MaxSmartApplicationTests(unittest.TestCase):
         with self.assertRaises(ConversationStateError):
             applied.messages_to_save()
 
-    def test_prepare_normalizes_history_to_role_and_content(self):
-        prepared = prepare_turn(
-            [
-                {
-                    "role": "assistant",
-                    "content": "Earlier",
-                    "timestamp": "2026-10-31T19:21:00+08:00",
-                }
-            ],
-            "Hello",
-        )
+    def test_history_fields_are_preserved_only_in_saved_snapshot(self):
+        history = [{
+            "role": "assistant",
+            "content": "Earlier",
+            "name": "participant",
+            "metadata": {"tags": ["original"], "archived": False},
+        }]
+        prepared = prepare_turn(history, "Hello")
+        history[0]["metadata"]["tags"].append("mutated after prepare")
 
         self.assertEqual(
             prepared.request_messages(),
@@ -238,10 +236,17 @@ class MaxSmartApplicationTests(unittest.TestCase):
             prepared,
             ModelOutcome(ModelOutcomeKind.SUCCESS, "Reply"),
         )
+        first_save = applied.messages_to_save()
+        first_save[0]["metadata"]["tags"].append("mutated by saver")
         self.assertEqual(
             applied.messages_to_save(),
             [
-                {"role": "assistant", "content": "Earlier"},
+                {
+                    "role": "assistant",
+                    "content": "Earlier",
+                    "name": "participant",
+                    "metadata": {"tags": ["original"], "archived": False},
+                },
                 {"role": "user", "content": "Hello"},
                 {"role": "assistant", "content": "Reply"},
             ],
@@ -663,7 +668,7 @@ class MaxSmartApplicationTests(unittest.TestCase):
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 called_names.add(node.func.id)
 
-        self.assertEqual(imported_roots, {"dataclasses", "enum", "typing"})
+        self.assertEqual(imported_roots, {"copy", "dataclasses", "enum", "json", "typing"})
         self.assertTrue(
             {"openai", "dotenv", "os", "pathlib", "session"}.isdisjoint(
                 imported_roots

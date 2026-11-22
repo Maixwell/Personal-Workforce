@@ -3,6 +3,8 @@
 The online backup API copies a consistent snapshot, including committed WAL
 pages. Publication uses a private temporary file, an exclusive link, and
 file and directory fsync. An existing destination is never replaced.
+Restore publishes a READY initialization marker after the main database is
+durable so the repository can open it.
 
 sqlite3.connect addresses the source and temporary files by path. Identity
 is rechecked immediately before each connection. A substitution inside that
@@ -26,6 +28,7 @@ import secrets
 import sqlite3
 import stat
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,9 +39,13 @@ from max_smart_db.config import (
     SQLITE_BUSY_TIMEOUT_SECONDS,
 )
 from max_smart_db.safety import (
+    SQLITE_INITIALIZATION_READY,
+    SQLITE_INITIALIZATION_STATE_SUFFIX,
+    SQLITE_INITIALIZATION_TEMP_SUFFIX,
     SQLITE_SIDECAR_SUFFIXES,
     DatabaseSafetyError,
     _check_ready_initialization_marker,
+    _create_marker_exclusively,
     validate_test_database_path,
     verify_local_apfs,
     verify_sqlite_connection_version,
@@ -114,7 +121,8 @@ def backup_disposable_sqlite(source, destination):
 def restore_disposable_sqlite(backup, destination):
     """Restore one disposable backup into a fresh destination.
 
-    The destination is accepted only after its integrity check succeeds.
+    The destination is accepted only after its integrity check succeeds and
+    its READY marker is published.
     """
 
     return _copy_disposable_database(
@@ -225,8 +233,8 @@ def _artifact_paths(path):
     text = str(path)
     for suffix in SQLITE_SIDECAR_SUFFIXES:
         paths.append(Path(f"{text}{suffix}"))
-    paths.append(Path(f"{text}.initialization-state"))
-    paths.append(Path(f"{text}.initialization-state.tmp"))
+    paths.append(Path(f"{text}{SQLITE_INITIALIZATION_STATE_SUFFIX}"))
+    paths.append(Path(f"{text}{SQLITE_INITIALIZATION_TEMP_SUFFIX}"))
     return tuple(paths)
 
 
@@ -291,14 +299,14 @@ def _require_destination_unpublished(destination, operation, listed=None):
             _fail(operation, "artifact_exists")
 
 
-def _require_published_siblings_clear(destination, operation):
+def _require_published_siblings_clear(destination, operation, *, owned_marker=None):
     """Refuse success when a sibling appeared beside the published file.
 
     Unexpected siblings are left untouched.
     """
 
     for artifact in _artifact_paths(destination)[1:]:
-        if _status_or_none(artifact) is not None:
+        if artifact != owned_marker and _status_or_none(artifact) is not None:
             _fail(operation, "artifact_exists")
 
 
@@ -372,10 +380,34 @@ def _connect(path, operation, *, readonly):
     return connection
 
 
-def _snapshot_database(source_connection, target_connection):
-    """Copy one consistent snapshot. Tests use this boundary to plant races."""
+def _snapshot_database(source_connection, target_connection, operation):
+    """Copy a snapshot with a bounded wait for forward progress."""
 
-    source_connection.backup(target_connection, pages=1, sleep=0.0)
+    deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_SECONDS
+    fewest_remaining = None
+
+    def check_progress(status, remaining, _total):
+        nonlocal deadline, fewest_remaining
+        if status == sqlite3.SQLITE_DONE:
+            return
+        now = time.monotonic()
+        if status == sqlite3.SQLITE_OK and (
+            fewest_remaining is None or remaining < fewest_remaining
+        ):
+            # A concurrent writer can restart the copy and increase remaining.
+            fewest_remaining = remaining
+            deadline = now + SQLITE_BUSY_TIMEOUT_SECONDS
+        elif now >= deadline:
+            if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                _fail(operation, "lock_contention")
+            _fail(operation, "snapshot_timeout")
+
+    source_connection.backup(
+        target_connection,
+        pages=1,
+        progress=check_progress,
+        sleep=0.05,
+    )
 
 
 def _require_integrity(connection, operation):
@@ -414,10 +446,9 @@ def _create_temp(parent, label, operation):
             or stat.S_IMODE(current.st_mode) != 0o600
         ):
             _fail(operation, "identity")
+        return path, _recheck(path, current, operation)
     finally:
         os.close(descriptor)
-    listed = _recheck(path, path.lstat(), operation)
-    return path, listed
 
 
 def _remove_owned_file(path, device, inode, operation):
@@ -486,6 +517,34 @@ def _fsync_directory(directory, expected, operation, *, uncertain):
         os.close(descriptor)
 
 
+def _publish_ready_marker(destination, database_status, parent_status, operation):
+    marker = Path(f"{destination}{SQLITE_INITIALIZATION_STATE_SUFFIX}")
+    staging = Path(f"{destination}{SQLITE_INITIALIZATION_TEMP_SUFFIX}")
+    try:
+        identity = _create_marker_exclusively(staging, SQLITE_INITIALIZATION_READY)
+    except DatabaseSafetyError as error:
+        if error.code == "database_initialization_artifact_exists":
+            _fail(operation, "artifact_exists")
+        _fail(operation, "interrupted")
+    _recheck(staging, identity, operation)
+    _require_published_siblings_clear(destination, operation, owned_marker=staging)
+    if _recheck(destination, database_status, operation).st_nlink != 1:
+        _fail(operation, "cleanup_uncertain")
+    try:
+        os.link(staging, marker)
+    except FileExistsError:
+        _fail(operation, "artifact_exists")
+    except OSError:
+        _fail(operation, "interrupted")
+    _recheck(marker, identity, operation)
+    # The repository refuses the database while the staging marker exists.
+    _remove_owned_file(staging, identity.st_dev, identity.st_ino, operation)
+    _fsync_directory(destination.parent, parent_status, operation, uncertain=True)
+    _recheck(marker, identity, operation)
+    _require_ready_marker(destination, operation)
+    return marker
+
+
 def _prepare_restore(connection, operation):
     try:
         connection.execute("PRAGMA foreign_keys=ON")
@@ -549,7 +608,6 @@ def _copy_disposable_database(source, destination, operation, *, enable_wal):
     source_status = _open_verified(source_path, source_status, operation)
     temporary_path = None
     temporary_status = None
-    published = False
     source_connection = None
     target_connection = None
     try:
@@ -571,7 +629,7 @@ def _copy_disposable_database(source, destination, operation, *, enable_wal):
         target_connection = _connect(temporary_path, operation, readonly=False)
         try:
             verify_sqlite_connection_version(target_connection, module_version)
-            _snapshot_database(source_connection, target_connection)
+            _snapshot_database(source_connection, target_connection, operation)
             if enable_wal:
                 _prepare_restore(target_connection, operation)
             _require_integrity(target_connection, operation)
@@ -605,7 +663,6 @@ def _copy_disposable_database(source, destination, operation, *, enable_wal):
             _fail(operation, "exists")
         except OSError as error:
             _fail(operation, "interrupted")
-        published = True
         published_status = _recheck(destination_path, temporary_status, operation)
         _require_published_siblings_clear(destination_path, operation)
         _fsync_directory(
@@ -631,6 +688,16 @@ def _copy_disposable_database(source, destination, operation, *, enable_wal):
         if final.st_nlink != 1:
             _fail(operation, "cleanup_uncertain")
         _require_published_siblings_clear(destination_path, operation)
+        if enable_wal:
+            ready_marker = _publish_ready_marker(
+                destination_path, final, parent_status, operation,
+            )
+            final = _recheck(destination_path, final, operation)
+            if final.st_nlink != 1:
+                _fail(operation, "cleanup_uncertain")
+            _require_published_siblings_clear(
+                destination_path, operation, owned_marker=ready_marker,
+            )
         return DisposableDatabaseCopy(
             str(destination_path),
             final.st_dev,
